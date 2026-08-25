@@ -1,0 +1,1298 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Chepicky" />
+<meta name="mobile-web-app-capable" content="yes" />
+<title>Chepicky · 체피키</title>
+<meta name="app-build" content="demo-v4-logofix" />
+
+<!-- PWA 파일 연결 -->
+<link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png?v=10" />
+<link rel="apple-touch-icon" sizes="167x167" href="icons/apple-touch-icon-167.png?v=10" />
+<link rel="apple-touch-icon" sizes="152x152" href="icons/apple-touch-icon-152.png?v=10" />
+<link rel="apple-touch-icon" sizes="120x120" href="icons/apple-touch-icon-120.png?v=10" />
+<link rel="apple-touch-icon-precomposed" href="icons/apple-touch-icon.png?v=10" />
+<link rel="icon" href="icons/icon-192.png?v=10" />
+<link rel="manifest" href="manifest.webmanifest" />
+
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #08090f; }
+  @media (prefers-color-scheme: light) { html, body { background: #F7F8FC; } }
+  #boot { padding: 48px 20px; font-family: -apple-system, sans-serif; color: #888; text-align: center; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="root"><div id="boot">불러오는 중…</div></div>
+
+<script>
+/* 이 기기의 브라우저 저장소에 보관 */
+(function () {
+  var NS = "cardpicker:";
+  window.storage = {
+    get: function (key) {
+      var raw = localStorage.getItem(NS + key);
+      if (raw === null) return Promise.reject(new Error("not found"));
+      return Promise.resolve({ key: key, value: raw });
+    },
+    set: function (key, value) {
+      localStorage.setItem(NS + key, value);
+      return Promise.resolve({ key: key, value: value });
+    },
+    delete: function (key) {
+      var had = localStorage.getItem(NS + key) !== null;
+      localStorage.removeItem(NS + key);
+      return Promise.resolve({ key: key, deleted: had });
+    },
+    list: function (prefix) {
+      var p = NS + (prefix || "");
+      return Promise.resolve({
+        keys: Object.keys(localStorage).filter(function (k) { return k.indexOf(p) === 0; })
+          .map(function (k) { return k.slice(NS.length); })
+      });
+    }
+  };
+})();
+window.addEventListener("error", function (e) {
+  var b = document.getElementById("boot");
+  if (b) b.textContent = "오류: " + (e.message || e);
+});
+</script>
+
+<script>
+"use strict";
+const { useState, useEffect, useMemo, useCallback } = window.React;
+
+/* ================================================================
+   한글 금액 변환 함수
+================================================================= */
+function numberToKorean(num) {
+  const n = Number(num);
+  if (!n || isNaN(n) || n <= 0) return "";
+  const digits = ["", "일", "이", "삼", "사", "오", "육", "칠", "팔", "구"];
+  const units = ["", "십", "백", "천"];
+  const bigUnits = ["", "만", "억", "조"];
+  
+  let str = String(Math.floor(n));
+  let len = str.length;
+  let parts = [];
+  
+  for (let i = 0; i < len; i += 4) {
+    let chunk = str.slice(Math.max(0, len - i - 4), len - i);
+    let chunkKor = "";
+    let cLen = chunk.length;
+    
+    for (let j = 0; j < cLen; j++) {
+      let d = parseInt(chunk[j], 10);
+      if (d > 0) {
+        let u = units[cLen - 1 - j];
+        let digitStr = digits[d];
+        if (d === 1 && u !== "") digitStr = "";
+        chunkKor += digitStr + u;
+      }
+    }
+    if (chunkKor) {
+      parts.unshift(chunkKor + bigUnits[i / 4]);
+    }
+  }
+  return parts.join(" ") + "원";
+}
+
+/* ================================================================
+   카드 모델
+================================================================= */
+const CATEGORY_GROUPS = [
+    { section: "식음료", items: ["음식점", "카페", "배달앱", "편의점"] },
+    { section: "교통", items: ["택시", "대중교통/KTX", "주유"] },
+    { section: "쇼핑", items: ["쿠팡", "온라인쇼핑", "마트/생활", "패션/뷰티", "백화점/면세점"] },
+    { section: "정기결제", items: ["통신비", "멤버십", "OTT/구독"] },
+    { section: "기타", items: ["해외결제", "병원/약국", "보험", "문화/여가", "기타"] },
+];
+const ALL_CATEGORIES = CATEGORY_GROUPS.reduce((a, g) => a.concat(g.items), []);
+// 검색용 키워드 (이용처 이름으로 찾을 수 있게)
+const CATEGORY_KEYWORDS = {
+    "음식점": ["식당", "밥", "고기", "한식", "중식", "일식", "양식", "회", "국밥", "면옥", "레스토랑", "술집", "포차"],
+    "카페": ["커피", "스타벅스", "스벅", "투썸", "이디야", "메가", "빽다방", "컴포즈", "디저트", "베이커리", "빵"],
+    "배달앱": ["쿠팡이츠", "배달의민족", "배민", "요기요", "배달"],
+    "편의점": ["cu", "씨유", "gs25", "지에스", "세븐일레븐", "이마트24", "미니스톱"],
+    "택시": ["카카오t", "카카오택시", "우버", "타다", "택시비"],
+    "대중교통/KTX": ["ktx", "기차", "철도", "코레일", "지하철", "버스", "srt", "교통카드"],
+    "주유": ["주유소", "기름", "sk에너지", "gs칼텍스", "s-oil", "현대오일", "충전", "전기차"],
+    "쿠팡": ["coupang", "로켓배송", "쿠팡와우"],
+    "온라인쇼핑": ["네이버페이", "지마켓", "11번가", "ssg", "쓱", "옥션", "무신사", "컬리", "알리", "테무", "인터넷쇼핑", "간편결제", "토스페이", "카카오페이"],
+    "마트/생활": ["이마트", "홈플러스", "롯데마트", "다이소", "생활용품", "잡화", "꽃집", "플라워", "철물"],
+    "패션/뷰티": ["옷", "의류", "신발", "미용실", "헤어", "네일", "화장품", "올리브영", "뷰티", "패션"],
+    "백화점/면세점": ["백화점", "현대백화점", "신세계", "롯데백화점", "면세점", "아울렛", "롯데몰", "스타필드"],
+    "통신비": ["skt", "kt", "lg유플러스", "유플러스", "핸드폰", "휴대폰", "요금제", "알뜰폰"],
+    "멤버십": ["쿠팡와우", "네이버플러스", "와우멤버십", "멤버쉽"],
+    "OTT/구독": ["넷플릭스", "유튜브", "디즈니", "왓챠", "티빙", "웨이브", "스포티파이", "애플", "apple", "구글", "chatgpt", "클로드", "구독"],
+    "해외결제": ["해외", "외화", "달러", "직구", "amazon", "아마존"],
+    "병원/약국": ["병원", "의원", "약국", "치과", "한의원", "진료", "clinic"],
+    "보험": ["보험료", "생명", "손해보험", "실비"],
+    "문화/여가": ["cgv", "메가박스", "롯데시네마", "영화", "공연", "전시", "헬스", "짐", "pt", "골프", "노래방"],
+    "기타": ["관리비", "세금", "공과금", "기부"],
+};
+const DEFAULT_CARDS = [
+    {
+        id: "shinhan",
+        name: "신한카드 처음",
+        sub: "ANNIVERSE",
+        color: "#5B4B8A",
+        accent: "#8E7BC9",
+        mileageMode: false,
+        tiers: [300000, 500000, 1000000],
+        overallCaps: [18000, 36000, 70000],
+        baselines: { "2026-07": 1200000 },
+        billingStartDay: 12,
+        excludeInstallment: true,
+        carryover: { "2026-08": 180000, "2026-09": 60000, "2026-10": 60000 },
+        groups: {
+            "오늘도 5%": { caps: [5000, 10000, 20000], dailyCap: 1000 },
+            "일상 속 5%": { caps: [5000, 10000, 20000], dailyCap: null },
+            "정기결제": { caps: [5000, 10000, 20000], dailyCap: null },
+        },
+        notes: [
+            "오늘도 5%: 1회 이용금액 1만원까지만 인정 (건당 최대 500P), 하루 최대 1천P.",
+            "음식점·카페·편의점은 오프라인 결제만 적립. 배달앱 결제는 제외.",
+            "백화점·할인점·면세점·공항·기차역 내 임대매장은 적립 제외.",
+            "일상 속 5%: 1회 이용금액 5만원까지 인정. 택시·KTX·생활·패션·해외 일시불 포함.",
+            "정기결제: 멤버십(쿠팡와우·네이버플러스) 20%, OTT 15%, 통신 10%. 통신은 월 1회·3만원까지.",
+            "세 그룹 각각의 한도와 별개로 카드 전체 통합 한도가 따로 적용돼요.",
+        ],
+        rates: {
+            "음식점": { rate: 5, group: "오늘도 5%", perTxnCap: 10000 },
+            "카페": { rate: 5, group: "오늘도 5%", perTxnCap: 10000 },
+            "편의점": { rate: 5, group: "오늘도 5%", perTxnCap: 10000 },
+            "쿠팡": { rate: 5, group: "오늘도 5%", perTxnCap: 10000 },
+            "배달앱": { rate: 0, group: null, perTxnCap: null },
+            "택시": { rate: 5, group: "일상 속 5%", perTxnCap: 50000 },
+            "대중교통/KTX": { rate: 5, group: "일상 속 5%", perTxnCap: 50000 },
+            "마트/생활": { rate: 5, group: "일상 속 5%", perTxnCap: 50000 },
+            "패션/뷰티": { rate: 5, group: "일상 속 5%", perTxnCap: 50000 },
+            "해외결제": { rate: 5, group: "일상 속 5%", perTxnCap: 50000 },
+            "주유": { rate: 0, group: null, perTxnCap: null },
+            "온라인쇼핑": { rate: 0, group: null, perTxnCap: null },
+            "백화점/면세점": { rate: 0, group: null, perTxnCap: null },
+            "통신비": { rate: 10, group: "정기결제", perTxnCap: 30000 },
+            "멤버십": { rate: 20, group: "정기결제", perTxnCap: null },
+            "OTT/구독": { rate: 15, group: "정기결제", perTxnCap: null },
+            "병원/약국": { rate: 0, group: null, perTxnCap: null },
+            "보험": { rate: 0, group: null, perTxnCap: null },
+            "문화/여가": { rate: 0, group: null, perTxnCap: null },
+            "기타": { rate: 0, group: null, perTxnCap: null },
+        },
+    },
+    {
+        id: "skypass",
+        name: "삼성 마일리지",
+        sub: "SKYPASS",
+        color: "#1B4B5A",
+        accent: "#C99F52",
+        mileageMode: true,
+        mileageValue: 15,
+        tiers: [0],
+        overallCaps: [null],
+        baselines: {},
+        billingStartDay: 13,
+        excludeInstallment: true,  // 무이자할부 결제는 마일리지 적립 제외
+        carryover: { "2026-09": 49000 },  // 연회비
+        groups: {
+            "특별적립": { caps: [2000], dailyCap: null },
+        },
+        notes: [
+            "전월실적 조건 없음. 기본적립 1,000원당 1마일은 한도 없이 적용.",
+            "무이자할부로 결제하면 마일리지가 적립되지 않아요.",
+            "특별적립(백화점·주유·커피·편의점·택시)은 4~5개 영역 합산 월 2,000마일까지 1,000원당 2마일.",
+            "특별적립 한도를 넘기면 그 이후는 기본 1마일만 적립돼요.",
+            "대중교통·택시·공과금·국세/지방세·아파트관리비·상품권 구매는 적립 제외 대상이라 카드사 안내가 엇갈려요. 택시 적립 여부는 명세서로 한 번 확인해보세요.",
+            "마일 가치는 사용처에 따라 편차가 큽니다(마일리지몰 3~10원, 국내선 10원 안팎, 장거리 상위 클래스는 훨씬 높음).",
+        ],
+        rates: {
+            "택시": { miles: 2, group: "특별적립", perTxnCap: null },
+            "카페": { miles: 2, group: "특별적립", perTxnCap: null },
+            "편의점": { miles: 2, group: "특별적립", perTxnCap: null },
+            "백화점/면세점": { miles: 2, group: "특별적립", perTxnCap: null },
+            "주유": { miles: 2, group: "특별적립", perTxnCap: null },
+            "음식점": { miles: 1, group: null, perTxnCap: null },
+            "배달앱": { miles: 1, group: null, perTxnCap: null },
+            "대중교통/KTX": { miles: 1, group: null, perTxnCap: null },
+            "쿠팡": { miles: 1, group: null, perTxnCap: null },
+            "온라인쇼핑": { miles: 1, group: null, perTxnCap: null },
+            "마트/생활": { miles: 1, group: null, perTxnCap: null },
+            "패션/뷰티": { miles: 1, group: null, perTxnCap: null },
+            "통신비": { miles: 1, group: null, perTxnCap: null },
+            "멤버십": { miles: 1, group: null, perTxnCap: null },
+            "OTT/구독": { miles: 1, group: null, perTxnCap: null },
+            "해외결제": { miles: 1, group: null, perTxnCap: null },
+            "병원/약국": { miles: 1, group: null, perTxnCap: null },
+            "보험": { miles: 1, group: null, perTxnCap: null },
+            "문화/여가": { miles: 1, group: null, perTxnCap: null },
+            "기타": { miles: 1, group: null, perTxnCap: null },
+        },
+    },
+    {
+        id: "toss_samsung",
+        name: "토스 삼성카드",
+        sub: "TOSS",
+        color: "#0050FF",
+        accent: "#4C8AFF",
+        mileageMode: false,
+        tiers: [300000, 600000, 900000],
+        overallCaps: [null, null, null],
+        baselines: { "2026-07": 650000 },
+        billingStartDay: 13,
+        carryover: { "2026-08": 120000, "2026-09": 40000, "2026-10": 40000 },
+        discountAtBilling: true,  // 결제일할인 방식
+        excludeInstallment: true,  // 할부 결제는 할인 대상 제외
+        groups: {
+            "온라인/간편결제": { caps: [10000, 20000, 30000], dailyCap: null },
+            "디지털 구독": { caps: [5000, 10000, 10000], dailyCap: null },
+            "카페할인": { caps: [5000, 5000, 5000], dailyCap: null },
+        },
+        notes: [
+            "⚠ 구간별 한도는 추정치예요. 삼성카드 앱 상품설명서 숫자로 꼭 바꿔주세요.",
+            "토스페이·토스쇼핑 15%, 그 외 온라인/간편결제(쿠팡·SSG·네이버페이 등) 10% 결제일할인.",
+            "토스프라임·인앱결제·디지털콘텐츠(넷플릭스·유튜브 등) 50% 결제일할인.",
+            "스타벅스 50% 할인은 전월실적 30만원 이상일 때 월 5천원까지.",
+            "해외 가맹점은 전월실적과 무관하게 2% 할인.",
+            "공과금·국세/지방세·아파트관리비·상품권 구매는 실적 제외 대상이에요.",
+        ],
+        rates: {
+            "쿠팡": { rate: 10, group: "온라인/간편결제", perTxnCap: null },
+            "온라인쇼핑": { rate: 10, group: "온라인/간편결제", perTxnCap: null },
+            "멤버십": { rate: 10, group: "온라인/간편결제", perTxnCap: null },
+            "OTT/구독": { rate: 50, group: "디지털 구독", perTxnCap: null },
+            "카페": { rate: 50, group: "카페할인", perTxnCap: null },
+            "해외결제": { rate: 2, group: null, perTxnCap: null },
+            "음식점": { rate: 0, group: null, perTxnCap: null },
+            "배달앱": { rate: 0, group: null, perTxnCap: null },
+            "편의점": { rate: 0, group: null, perTxnCap: null },
+            "택시": { rate: 0, group: null, perTxnCap: null },
+            "대중교통/KTX": { rate: 0, group: null, perTxnCap: null },
+            "주유": { rate: 0, group: null, perTxnCap: null },
+            "마트/생활": { rate: 0, group: null, perTxnCap: null },
+            "패션/뷰티": { rate: 0, group: null, perTxnCap: null },
+            "백화점/면세점": { rate: 0, group: null, perTxnCap: null },
+            "통신비": { rate: 0, group: null, perTxnCap: null },
+            "병원/약국": { rate: 0, group: null, perTxnCap: null },
+            "보험": { rate: 0, group: null, perTxnCap: null },
+            "문화/여가": { rate: 0, group: null, perTxnCap: null },
+            "기타": { rate: 0, group: null, perTxnCap: null },
+        },
+    },
+];
+
+/* 카드사별 대표 카드 카탈로그. supported=true 인 카드만 선택 가능 */
+const ISSUERS = [
+    { id: "kb", name: "국민카드", color: "#6B5B4E", cards: [
+        { name: "KB국민 탄탄대로 온리유", supported: false },
+        { name: "KB국민 청춘대로 톡톡", supported: false },
+        { name: "KB국민 다담", supported: false },
+    ] },
+    { id: "shinhan", name: "신한카드", color: "#5B4B8A", cards: [
+        { name: "신한카드 처음 (ANNIVERSE)", supported: true, cardId: "shinhan" },
+        { name: "신한카드 Deep Dream", supported: false },
+        { name: "신한카드 Mr.Life", supported: false },
+        { name: "신한카드 The BEST-F", supported: false },
+    ] },
+    { id: "samsung", name: "삼성카드", color: "#1B4B5A", cards: [
+        { name: "삼성 마일리지 플래티넘 (스카이패스)", supported: true, cardId: "skypass" },
+        { name: "토스 삼성카드", supported: true, cardId: "toss_samsung" },
+        { name: "삼성카드 taptap O", supported: false },
+        { name: "삼성 iD ON 카드", supported: false },
+    ] },
+    { id: "lotte", name: "롯데카드", color: "#B03A3A", cards: [
+        { name: "LOCA 클래식", supported: false },
+        { name: "LOCA LIKIT 1.2", supported: false },
+        { name: "로카 365", supported: false },
+    ] },
+];
+const INSTALLMENT_OPTIONS = [1, 2, 3, 6, 12];
+const SEED_FLAG = "demo-seed-v1";
+const SEED_TXNS = [{"date":"2026-08-03","cardId":"shinhan","category":"음식점","amount":32000,"capUsed":500,"rewardValue":500,"installmentMonths":1,"id":"s0","status":"confirmed"},{"date":"2026-08-05","cardId":"shinhan","category":"택시","amount":12000,"capUsed":600,"rewardValue":600,"installmentMonths":1,"id":"s1","status":"confirmed"},{"date":"2026-08-07","cardId":"toss_samsung","category":"쿠팡","amount":28000,"capUsed":2800,"rewardValue":2800,"installmentMonths":1,"id":"s2","status":"confirmed"},{"date":"2026-08-09","cardId":"shinhan","category":"카페","amount":6000,"capUsed":300,"rewardValue":300,"installmentMonths":1,"id":"s3","status":"confirmed"},{"date":"2026-08-12","cardId":"skypass","category":"편의점","amount":9000,"capUsed":18,"rewardValue":270,"installmentMonths":1,"id":"s4","status":"confirmed"},{"date":"2026-08-14","cardId":"shinhan","category":"OTT/구독","amount":13500,"capUsed":2025,"rewardValue":2025,"installmentMonths":1,"id":"s5","status":"confirmed"},{"date":"2026-08-17","cardId":"toss_samsung","category":"온라인쇼핑","amount":45000,"capUsed":4500,"rewardValue":4500,"installmentMonths":1,"id":"s6","status":"confirmed"},{"date":"2026-08-19","cardId":"shinhan","category":"마트/생활","amount":38000,"capUsed":1900,"rewardValue":1900,"installmentMonths":1,"id":"s7","status":"confirmed"},{"date":"2026-08-21","cardId":"skypass","category":"택시","amount":18000,"capUsed":36,"rewardValue":540,"installmentMonths":1,"id":"s8","status":"confirmed"}];
+const STORAGE_OTHER = "demo-card-other-v1";
+const STORAGE_CARDS = "demo-card-configs-v5";
+const STORAGE_TXNS = "demo-card-txns-v5";
+const fmt = (n) => Math.round(n).toLocaleString("ko-KR");
+const yyyymm = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+const prevYyyymm = (d) => yyyymm(new Date(d.getFullYear(), d.getMonth() - 1, 1));
+/* 카드별 청구 주기 반영: 청구기간 = 전월 startDay ~ 당월 (startDay-1).
+   따라서 이용일이 startDay 이후면 다음 달 청구분이 된다. */
+const billedMonths = (dateStr, n, startDay) => {
+    const d = new Date(dateStr);
+    const sd = startDay || 1;
+    let baseMonth = d.getMonth();
+    if (d.getDate() >= sd) baseMonth += 1;
+    const out = [];
+    for (let i = 0; i < n; i++)
+        out.push(yyyymm(new Date(d.getFullYear(), baseMonth + i, 1)));
+    return out;
+};
+/* 다음 결제일이 속한 월. 25일이 지나면 다음 달로 넘어간다. */
+const nextBillingMonth = (now) => {
+    const m = now.getDate() > 25 ? now.getMonth() + 1 : now.getMonth();
+    return yyyymm(new Date(now.getFullYear(), m, 1));
+};
+const nextMonthKey = (mk) => { const [y, m] = mk.split("-").map(Number); return yyyymm(new Date(y, m, 1)); };
+const perInstallment = (amount, n) => Math.round(amount / (n || 1));
+const tierIndexFor = (card, prevTotal) => {
+    let idx = -1;
+    for (let i = 0; i < card.tiers.length; i++)
+        if (prevTotal >= card.tiers[i])
+            idx = i;
+    return idx;
+};
+
+/* ================= 테마 ================= */
+function useSystemTheme() {
+    const [dark, setDark] = useState(() => typeof window !== "undefined" && window.matchMedia
+        ? window.matchMedia("(prefers-color-scheme: dark)").matches
+        : true);
+    useEffect(() => {
+        if (!window.matchMedia)
+            return;
+        const mq = window.matchMedia("(prefers-color-scheme: dark)");
+        const h = (e) => setDark(e.matches);
+        mq.addEventListener ? mq.addEventListener("change", h) : mq.addListener(h);
+        return () => { mq.removeEventListener ? mq.removeEventListener("change", h) : mq.removeListener(h); };
+    }, []);
+    return dark;
+}
+const makeTheme = (dark) => dark ? {
+    bg: "radial-gradient(120% 120% at 20% -10%, #1c2340 0%, #0c0e1a 55%, #08090f 100%)",
+    text: "#EDEBF6", textDim: "#A9B0D0", textFaint: "#7A81A3",
+    surface: "rgba(255,255,255,0.045)", border: "rgba(255,255,255,0.08)",
+    borderStrong: "rgba(255,255,255,0.15)", inputBg: "rgba(255,255,255,0.06)",
+    chipBg: "rgba(255,255,255,0.07)", chipText: "#C3C9E4", accent: "#7FA8FF", onAccent: "#0B0E1C",
+    good: "#8FE3AF", warn: "#E9CFA9", warnBg: "rgba(232,177,92,0.08)",
+    bad: "#E8735C", badBg: "rgba(232,115,92,0.10)", track: "rgba(255,255,255,0.08)",
+    tabbar: "rgba(10,12,22,0.92)",
+    heroBg: "linear-gradient(135deg, rgba(127,168,255,0.14), rgba(127,168,255,0.05))",
+    heroBorder: "rgba(127,168,255,0.30)", heroLabel: "#B9CDFF", accentSoft: "rgba(127,168,255,0.18)",
+    cherry: "#FF6B8A", cherryOn: "#1A0710", cherrySoft: "rgba(255,107,138,0.16)",
+    cherryGlow: "rgba(255,107,138,0.45)",
+} : {
+    bg: "linear-gradient(180deg, #F7F8FC 0%, #EFF1F8 100%)",
+    text: "#1A1D2E", textDim: "#5B6280", textFaint: "#8B92AC",
+    surface: "#FFFFFF", border: "rgba(20,24,50,0.10)",
+    borderStrong: "rgba(20,24,50,0.18)", inputBg: "#F3F5FA",
+    chipBg: "#EDF0F7", chipText: "#4A5270", accent: "#3B6FE0", onAccent: "#FFFFFF",
+    good: "#1E9E63", warn: "#8A6320", warnBg: "rgba(232,177,92,0.16)",
+    bad: "#C7452C", badBg: "rgba(199,69,44,0.08)", track: "rgba(20,24,50,0.10)",
+    tabbar: "rgba(255,255,255,0.94)",
+    heroBg: "linear-gradient(135deg, rgba(59,111,224,0.10), rgba(59,111,224,0.03))",
+    heroBorder: "rgba(59,111,224,0.28)", heroLabel: "#2E56B0", accentSoft: "rgba(59,111,224,0.12)",
+    cherry: "#E23E63", cherryOn: "#FFFFFF", cherrySoft: "rgba(226,62,99,0.10)",
+    cherryGlow: "rgba(226,62,99,0.35)",
+};
+
+function CardPicker() {
+    const dark = useSystemTheme();
+    const T = useMemo(() => makeTheme(dark), [dark]);
+    const S = useMemo(() => makeStyles(T), [T]);
+    const [cards, setCards] = useState(DEFAULT_CARDS);
+    const [txns, setTxns] = useState([]);
+    const [otherBilling, setOtherBilling] = useState({});
+    const [focusPending, setFocusPending] = useState(0);
+    const [loaded, setLoaded] = useState(false);
+    const [storageOk, setStorageOk] = useState(true);
+    const [lastSaved, setLastSaved] = useState(null);
+    const [tab, setTab] = useState("recommend");
+    const [stage, setStage] = useState("login");
+    const [pickedCards, setPickedCards] = useState([]);
+    const [category, setCategory] = useState("음식점");
+    const [catQuery, setCatQuery] = useState("");
+    const [amount, setAmount] = useState("");
+    const [months, setMonths] = useState(1);
+    const [result, setResult] = useState(null);
+    const now = new Date();
+    const today = now.toISOString().slice(0, 10);
+    const thisMonth = yyyymm(now);
+    const lastMonth = prevYyyymm(now);
+
+    useEffect(() => {
+        (async () => {
+            let ok = true;
+            try {
+                const c = await window.storage.get(STORAGE_CARDS, false);
+                if (c && c.value) setCards(JSON.parse(c.value));
+            } catch (e) { }
+            try {
+                const t = await window.storage.get(STORAGE_TXNS, false);
+                if (t && t.value) setTxns(JSON.parse(t.value));
+                else throw new Error("empty");
+            } catch (e) {
+                // 최초 실행 시에만: 엑셀에서 가져온 8월 내역을 초기 데이터로 주입
+                try {
+                    const seeded = await window.storage.get(SEED_FLAG, false);
+                    if (!(seeded && seeded.value)) throw new Error("not seeded");
+                } catch (e2) {
+                    setTxns(SEED_TXNS);
+                    try {
+                        await window.storage.set(STORAGE_TXNS, JSON.stringify(SEED_TXNS), false);
+                        await window.storage.set(SEED_FLAG, "1", false);
+                    } catch (e3) { }
+                }
+            }
+            try {
+                const o = await window.storage.get(STORAGE_OTHER, false);
+                if (o && o.value) setOtherBilling(JSON.parse(o.value));
+            } catch (e) { }
+            try {
+                await window.storage.set("__probe", "1", false);
+                const p = await window.storage.get("__probe", false);
+                ok = !!(p && p.value === "1");
+            } catch (e) { ok = false; }
+            setStorageOk(ok);
+            setLoaded(true);
+        })();
+    }, []);
+
+    const persist = useCallback(async (key, value) => {
+        try {
+            const r = await window.storage.set(key, JSON.stringify(value), false);
+            if (!r) { setStorageOk(false); return false; }
+            setStorageOk(true);
+            setLastSaved(new Date());
+            return true;
+        } catch (e) {
+            setStorageOk(false);
+            return false;
+        }
+    }, []);
+
+    const saveCards = useCallback(async (next) => { setCards(next); await persist(STORAGE_CARDS, next); }, [persist]);
+    const saveTxns = useCallback(async (next) => { setTxns(next); await persist(STORAGE_TXNS, next); }, [persist]);
+    const saveOther = useCallback(async (next) => { setOtherBilling(next); await persist(STORAGE_OTHER, next); }, [persist]);
+
+    const prevMonthTotals = useMemo(() => {
+        const m = {};
+        for (const c of cards) m[c.id] = (c.baselines && c.baselines[lastMonth]) || 0;
+        for (const t of txns) if (t.date.slice(0, 7) === lastMonth) m[t.cardId] = (m[t.cardId] || 0) + t.amount;
+        return m;
+    }, [txns, cards, lastMonth]);
+
+    const thisMonthTotals = useMemo(() => {
+        const m = {};
+        for (const c of cards) m[c.id] = (c.baselines && c.baselines[thisMonth]) || 0;
+        for (const t of txns) if (t.date.slice(0, 7) === thisMonth) m[t.cardId] = (m[t.cardId] || 0) + t.amount;
+        return m;
+    }, [txns, cards, thisMonth]);
+
+    const buildUsage = useCallback((cardId, excludeId) => {
+        const card = cards.find((c) => c.id === cardId);
+        const u = { total: 0, byGroup: {}, byGroupDay: {} };
+        if (!card) return u;
+        for (const t of txns) {
+            if (t.cardId !== cardId || t.id === excludeId) continue;
+            if (t.date.slice(0, 7) !== thisMonth) continue;
+            const used = t.capUsed || 0;
+            u.total += used;
+            const g = card.rates[t.category] && card.rates[t.category].group;
+            if (g) {
+                u.byGroup[g] = (u.byGroup[g] || 0) + used;
+                const k = `${g}|${t.date}`;
+                u.byGroupDay[k] = (u.byGroupDay[k] || 0) + used;
+            }
+        }
+        return u;
+    }, [txns, cards, thisMonth]);
+
+    const usageByCard = useMemo(() => {
+        const m = {};
+        for (const c of cards) m[c.id] = buildUsage(c.id, null);
+        return m;
+    }, [cards, buildUsage]);
+
+    const tierInfo = useCallback((card) => {
+        const prevTotal = prevMonthTotals[card.id] || 0;
+        const idx = tierIndexFor(card, prevTotal);
+        return {
+            idx, active: idx >= 0, prevTotal,
+            nextThreshold: idx + 1 < card.tiers.length ? card.tiers[idx + 1] : null,
+        };
+    }, [prevMonthTotals]);
+
+    const remainingCap = useCallback((card, cat, tIdx, u, dateStr) => {
+        const info = card.rates[cat];
+        if (!info) return 0;
+        let rem = Infinity;
+        if (info.group && card.groups[info.group]) {
+            const g = card.groups[info.group];
+            const gCap = g.caps[tIdx];
+            if (gCap != null) rem = Math.min(rem, Math.max(gCap - (u.byGroup[info.group] || 0), 0));
+            if (g.dailyCap != null) {
+                const usedToday = u.byGroupDay[`${info.group}|${dateStr}`] || 0;
+                rem = Math.min(rem, Math.max(g.dailyCap - usedToday, 0));
+            }
+        }
+        const oCap = card.overallCaps ? card.overallCaps[tIdx] : null;
+        if (oCap != null) rem = Math.min(rem, Math.max(oCap - u.total, 0));
+        return rem;
+    }, []);
+
+    const calcRewardRaw = useCallback((card, cat, amt, tIdx, u, dateStr, instMonths) => {
+        if (!amt || amt <= 0) return { rewardValue: 0, capUsed: 0, detail: "", notes: [] };
+        if (card.excludeInstallment && (instMonths || 1) > 1)
+            return { rewardValue: 0, capUsed: 0, detail: "할부 결제는 적립/할인 대상이 아니에요", notes: [] };
+        if (tIdx < 0) return { rewardValue: 0, capUsed: 0, detail: "전월실적 미충족 — 이번 달 혜택 비활성", notes: [] };
+        const info = card.rates[cat];
+        const notes = [];
+        const rem = remainingCap(card, cat, tIdx, u, dateStr);
+        let eligible = amt;
+        if (info && info.perTxnCap != null && amt > info.perTxnCap) {
+            eligible = info.perTxnCap;
+            notes.push(`1회 ${fmt(info.perTxnCap)}원까지만 인정돼요`);
+        }
+        if (card.mileageMode) {
+            if (!info || !info.miles) return { rewardValue: 0, capUsed: 0, detail: "적립 대상 아님", notes };
+            const bonus = info.miles;
+            const full = Math.floor(eligible / 1000) * bonus;
+            let earned, capUsed;
+            if (rem === Infinity) { earned = full; capUsed = 0; }
+            else if (full <= rem) { earned = full; capUsed = full; }
+            else {
+                const bonusAmt = (rem / bonus) * 1000;
+                earned = rem + Math.floor((eligible - bonusAmt) / 1000);
+                capUsed = rem;
+                notes.push("특별적립 한도 초과분은 기본 1마일만 적립");
+            }
+            const value = earned * (card.mileageValue || 15);
+            return {
+                rewardValue: value, capUsed, notes,
+                detail: `약 ${fmt(earned)}마일 · 마일당 ${card.mileageValue}원 가정 시 ${fmt(value)}원어치`,
+            };
+        }
+        if (!info || !info.rate) return { rewardValue: 0, capUsed: 0, detail: "혜택 대상 아님", notes };
+        const raw = (eligible * info.rate) / 100;
+        const reward = rem === Infinity ? raw : Math.min(raw, rem);
+        if (rem !== Infinity && raw > rem) notes.push("이번 달 남은 한도까지만 적립돼요");
+        return {
+            rewardValue: reward, capUsed: rem === Infinity ? 0 : reward, notes,
+            detail: `${info.rate}%${rem === Infinity ? " (한도 없음)" : ` · 남은 한도 ${fmt(rem)}원`}`,
+        };
+    }, [remainingCap]);
+
+    const calcReward = useCallback((card, cat, amt) => {
+        const t = tierInfo(card);
+        const u = usageByCard[card.id] || { total: 0, byGroup: {}, byGroupDay: {} };
+        return { ...calcRewardRaw(card, cat, amt, t.active ? t.idx : -1, u, today, months), tInfo: t };
+    }, [tierInfo, usageByCard, calcRewardRaw, today, months]);
+
+    const capWarnings = useMemo(() => {
+        const out = [];
+        for (const c of cards) {
+            const info = c.rates[category];
+            if (!info || (c.mileageMode ? !info.miles : !info.rate)) continue;
+            const t = tierInfo(c);
+            const u = usageByCard[c.id] || { total: 0, byGroup: {}, byGroupDay: {} };
+            if (!t.active) {
+                if (c.tiers[0] > 0)
+                    out.push({ tone: "off", text: `${c.name}은 전월실적 미충족으로 이번 달 혜택이 꺼져 있어요. (지난달 ${fmt(t.prevTotal)}원 / 기준 ${fmt(c.tiers[0])}원)` });
+                continue;
+            }
+            const rem = remainingCap(c, category, t.idx, u, today);
+            if (rem !== Infinity && rem <= 0) {
+                const g = info.group;
+                const gDef = g ? c.groups[g] : null;
+                const dayHit = gDef && gDef.dailyCap != null && (u.byGroupDay[`${g}|${today}`] || 0) >= gDef.dailyCap;
+                if (dayHit) {
+                    out.push({ tone: "capped", text: `${c.name}의 ${g} 오늘치 적립 한도(${fmt(gDef.dailyCap)}P)를 다 썼어요. 내일 결제하면 다시 적립돼요.` });
+                } else if (t.nextThreshold) {
+                    const need = Math.max(t.nextThreshold - (thisMonthTotals[c.id] || 0), 0);
+                    out.push({ tone: "capped", text: `${c.name}의 현재 실적 구간에서 ${category} 최대 적립 한도를 이미 달성했습니다. (다음 실적 구간까지 ${fmt(need)}원 결제 필요)` });
+                } else {
+                    out.push({ tone: "capped", text: `${c.name}의 ${category} 적립 한도를 이미 다 썼어요. 이 카드의 최고 구간이라 이번 달은 더 못 받아요.` });
+                }
+            }
+        }
+        return out;
+    }, [cards, category, tierInfo, usageByCard, remainingCap, thisMonthTotals, today]);
+
+    const runRecommend = () => {
+        const amt = Number(amount);
+        if (!amt || amt <= 0) return;
+        const ranked = cards.map((c) => ({ card: c, ...calcReward(c, category, amt) }))
+            .sort((a, b) => b.rewardValue - a.rewardValue);
+        setResult({ amt, category, ranked });
+    };
+
+    const logTxn = async (cardId, cat, amt, capUsed, rewardValue) => {
+        await saveTxns([...txns, {
+            id: Date.now() + Math.random().toString(16).slice(2),
+            date: today, cardId, category: cat, amount: amt, capUsed, rewardValue,
+            installmentMonths: months || 1, status: "pending",
+        }]);
+        setResult(null);
+        setAmount("");
+        setMonths(1);
+    };
+
+    const confirmTxn = async (id, actualAmount, actualMonths) => {
+        const t = txns.find((x) => x.id === id);
+        if (!t) return;
+        const card = cards.find((c) => c.id === t.cardId);
+        const ti = tierInfo(card);
+        const u = buildUsage(t.cardId, id);
+        const r = calcRewardRaw(card, t.category, actualAmount, ti.active ? ti.idx : -1, u, t.date, actualMonths || 1);
+        await saveTxns(txns.map((x) => x.id === id
+            ? { ...x, amount: actualAmount, installmentMonths: actualMonths || 1, capUsed: r.capUsed, rewardValue: r.rewardValue, status: "confirmed" }
+            : x));
+    };
+
+    const deleteTxn = async (id) => saveTxns(txns.filter((t) => t.id !== id));
+    const updateCard = (cardId, mutate) => saveCards(cards.map((c) => {
+        if (c.id !== cardId) return c;
+        const d = JSON.parse(JSON.stringify(c));
+        mutate(d);
+        return d;
+    }));
+
+    const summary = useMemo(() => {
+        const mine = txns.filter((t) => t.date.slice(0, 7) === thisMonth);
+        const pendingList = mine.filter((t) => t.status === "pending");
+        const confirmedList = mine.filter((t) => t.status === "confirmed");
+        const pending = pendingList.reduce((s, t) => s + t.amount, 0);
+        const confirmedAmount = confirmedList.reduce((s, t) => s + t.amount, 0);
+        const reward = confirmedList.reduce((s, t) => s + (t.rewardValue || 0), 0);
+        const parkingRate = confirmedAmount > 0 ? (reward / confirmedAmount) * 100 : null;
+        // 다음 결제일(25일) 기준 청구액. 25일이 지나면 자동으로 다음 달로 넘어간다.
+        const payMonth = nextBillingMonth(now);
+        let billing = 0, carriedOver = 0, billingDiscount = 0;
+        for (const t of txns) {
+            const n = t.installmentMonths || 1;
+            const card = cards.find((c) => c.id === t.cardId);
+            const sd = card ? card.billingStartDay : 1;
+            const months = billedMonths(t.date, n, sd);
+            const mi = months.indexOf(payMonth);
+            if (mi < 0) continue;
+            let slice = perInstallment(t.amount, n);
+            // 결제일할인 카드는 첫 청구 회차에서 할인액이 빠진 금액이 청구된다
+            if (card && card.discountAtBilling && mi === 0) {
+                slice = Math.max(slice - (t.rewardValue || 0), 0);
+                billingDiscount += (t.rewardValue || 0);
+            }
+            billing += slice;
+            if (n > 1) carriedOver += slice;
+        }
+        // 앱에 개별 기록이 없는 이전 달 할부/일시불 이월분
+        for (const c of cards) {
+            const co = c.carryover && c.carryover[payMonth];
+            if (co) { billing += co; carriedOver += co; }
+        }
+        // 앱에서 관리하지 않는 기타 카드들의 이번 결제일 청구 예정액
+        const otherCards = Number(otherBilling[payMonth] || 0);
+        billing += otherCards;
+        return { pending, pendingCount: pendingList.length, confirmedAmount, reward, parkingRate, billing, carriedOver, billingDiscount, otherCards, payMonth };
+    }, [txns, thisMonth, cards, otherBilling]);
+
+    if (!loaded)
+        return React.createElement("div", { style: S.loadingScreen }, React.createElement("div", { style: S.loadingDot }));
+
+    if (stage === "login")
+        return React.createElement(LoginScreen, { S: S, T: T, onLogin: () => setStage("onboarding") });
+    if (stage === "onboarding")
+        return React.createElement(OnboardScreen, { S: S, T: T, picked: pickedCards, setPicked: setPickedCards,
+            onDone: () => setStage("app") });
+
+    return (React.createElement("div", { style: S.app },
+        React.createElement("style", null, `
+        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        input:focus, button:focus, button:focus-visible, button:active {
+          outline: none !important; box-shadow: none;
+        }
+        button { font-family: inherit; cursor: pointer; -webkit-appearance: none; appearance: none; }
+        input::placeholder { color: ${T.textFaint}; }
+        .chip { transition: transform .12s ease, background .15s ease, box-shadow .15s ease, color .15s ease;
+                border: 0 !important; outline: 0 !important; }
+        .chip:focus, .chip:focus-visible, .chip:active, .chip:hover { border: 0 !important; outline: 0 !important; }
+        .chip:active { transform: scale(.95); }
+        @keyframes tabIn {
+          from { opacity: 0; transform: translateY(8px); }
+          to   { opacity: 1; transform: translateY(0); }
+        }
+        .tabview { animation: tabIn .26s cubic-bezier(.22,.9,.3,1) both; }
+        .tabbtn { position: relative; transition: color .18s ease; }
+        .tabbtn span.ink {
+          position: absolute; left: 50%; bottom: 2px; height: 3px; width: 22px;
+          margin-left: -11px; border-radius: 999px; transform: scaleX(0);
+          transition: transform .24s cubic-bezier(.22,.9,.3,1), opacity .18s ease; opacity: 0;
+        }
+        .tabbtn.on span.ink { transform: scaleX(1); opacity: 1; }
+        `),
+        React.createElement("header", { style: S.header },
+            React.createElement("div", { style: S.headerEyebrow }, "체리만 쏙, 골라 담는 카드 생활"),
+            React.createElement("h1", { style: S.headerTitle },
+                React.createElement("span", { style: S.headerCherry }, "\uD83C\uDF52"),
+                React.createElement("img", { src: dark ? "brand/logo-white.png" : "brand/logo-dark.png",
+                    alt: "Chepicky", style: S.headerLogoImg }))),
+        !storageOk && (React.createElement("div", { style: S.errorBanner }, "저장 기능을 쓸 수 없는 환경이에요. 지금 입력한 내용은 화면을 닫으면 사라집니다.")),
+        React.createElement(SummaryBar, { S: S, summary: summary, onPendingClick: () => { setTab("status"); setResult(null); setFocusPending((n) => n + 1); } }),
+        React.createElement("div", { className: "tabview", key: tab },
+            tab === "recommend" && (React.createElement(RecommendTab, { S: S, T: T, catQuery: catQuery, setCatQuery: setCatQuery, category: category, setCategory: setCategory, amount: amount, setAmount: setAmount, months: months, setMonths: setMonths, runRecommend: runRecommend, result: result, logTxn: logTxn, cards: cards, tierInfo: tierInfo, capWarnings: capWarnings })),
+        tab === "status" && (React.createElement(StatusTab, { S: S, cards: cards, tierInfo: tierInfo, usageByCard: usageByCard, txns: txns, thisMonth: thisMonth, lastMonth: lastMonth, thisMonthTotals: thisMonthTotals, deleteTxn: deleteTxn, confirmTxn: confirmTxn, focusPending: focusPending })),
+        tab === "settings" && (React.createElement(SettingsTab, { S: S, T: T, cards: cards, updateCard: updateCard, resetDefaults: () => saveCards(DEFAULT_CARDS), storageOk: storageOk, lastSaved: lastSaved, txnCount: txns.length, thisMonthKey: thisMonth, prevMonthKey: lastMonth, otherBilling: otherBilling, saveOther: saveOther, payMonth: summary.payMonth }))),
+        React.createElement("nav", { style: S.tabbar }, [["recommend", "추천"], ["status", "이번 달 현황"], ["settings", "카드 설정"]].map(([k, label]) => (
+            React.createElement("button", { key: k, className: "tabbtn" + (tab === k ? " on" : ""),
+                onClick: () => { setTab(k); setResult(null); window.scrollTo({ top: 0, behavior: "smooth" }); },
+                style: { ...S.tabBtn, ...(tab === k ? S.tabBtnActive : {}) } },
+                label,
+                React.createElement("span", { className: "ink", style: { background: T.cherry } })))))));
+}
+
+/* ============ 요약 ============ */
+/* ============ 로그인 (목업) ============ */
+function LoginScreen({ S, T, onLogin }) {
+    return React.createElement("div", { style: S.loginWrap },
+        React.createElement("div", { style: S.loginTop },
+            React.createElement("div", { style: S.loginTag }, "체리만 쏙, 골라 담는 카드 생활"),
+            React.createElement("img", { src: "brand/logo-white.png", alt: "Chepicky", style: S.loginLogoImg })),
+        React.createElement("div", { style: S.loginBtns },
+            React.createElement("button", { className: "chip", onClick: onLogin, style: S.oauthBtn },
+                React.createElement("img", { src: "brand/btn-kakao.png", alt: "카카오 로그인", style: S.oauthImg })),
+            React.createElement("button", { className: "chip", onClick: onLogin, style: S.oauthBtn },
+                React.createElement("img", { src: "brand/btn-naver.png", alt: "네이버 로그인", style: S.oauthImg })),
+            React.createElement("div", { style: S.loginNote }, "데모 화면입니다. 어느 버튼이든 눌러 진행하세요.")));
+}
+
+/* ============ 카드 등록 온보딩 (목업) ============ */
+function OnboardScreen({ S, T, picked, setPicked, onDone }) {
+    const [issuer, setIssuer] = useState("shinhan");
+    const iss = ISSUERS.find((x) => x.id === issuer);
+    const toggle = (c) => {
+        if (!c.supported) return;
+        setPicked(picked.includes(c.cardId)
+            ? picked.filter((x) => x !== c.cardId)
+            : picked.concat(c.cardId));
+    };
+    return React.createElement("div", { style: S.onbWrap },
+        React.createElement("div", { style: S.onbTag }, "체리만 쏙, 골라 담는 카드 생활"),
+        React.createElement("img", { src: "brand/logo-cherry.png", alt: "Chepicky", style: S.onbLogoImg }),
+        React.createElement("section", { style: S.onbCard },
+            React.createElement("div", { style: S.onbHead },
+                React.createElement("span", { style: S.onbTitle }, "내 카드 등록하기"),
+                React.createElement("span", { style: S.onbStep }, "Step 1")),
+            React.createElement("div", { style: S.onbLabel }, "카드사 선택"),
+            React.createElement("div", { style: S.onbIssuerRow }, ISSUERS.map((x) => (
+                React.createElement("button", { key: x.id, className: "chip",
+                    onClick: () => setIssuer(x.id),
+                    style: { ...S.onbIssuer, ...(issuer === x.id ? { background: T.cherry, color: "#fff", fontWeight: 700 } : {}) } },
+                    x.name)))),
+            React.createElement("div", { style: { ...S.onbLabel, marginTop: 18 } }, "카드 상품 선택"),
+            React.createElement("div", { style: S.onbCardList }, iss.cards.map((c) => {
+                const on = c.supported && picked.includes(c.cardId);
+                return React.createElement("button", { key: c.name, className: "chip",
+                    onClick: () => toggle(c),
+                    style: { ...S.onbItem,
+                        ...(c.supported ? {} : S.onbItemOff),
+                        ...(on ? { borderColor: T.cherry, background: T.cherrySoft } : {}) } },
+                    React.createElement("span", { style: { ...S.onbCheck, ...(on ? { background: T.cherry, borderColor: T.cherry, color: "#fff" } : {}) } }, on ? "\u2713" : ""),
+                    React.createElement("span", { style: S.onbItemText },
+                        c.name,
+                        !c.supported && React.createElement("span", { style: S.onbSoon }, " (혜택 정보 업데이트 예정)")));
+            })),
+            React.createElement("button", { className: "chip", onClick: onDone,
+                disabled: picked.length === 0,
+                style: { ...S.onbSubmit, opacity: picked.length ? 1 : 0.4 } },
+                picked.length ? `등록 완료 및 혜택 분석 (${picked.length}장)` : "카드를 1장 이상 선택해주세요"),
+            React.createElement("button", { className: "chip", onClick: onDone, style: S.onbSkip }, "나중에 하기")));
+}
+
+function SummaryBar({ S, summary, onPendingClick }) {
+    const pm = Number(summary.payMonth.slice(5));
+    return (React.createElement("div", { style: { margin: "0 16px 18px" } },
+        // 출금 예정 — 가장 중요한 숫자라 크게 단독 배치
+        React.createElement("div", { style: S.heroCell },
+            React.createElement("div", { style: S.heroRow },
+                React.createElement("div", { style: S.heroLabel }, `${pm}월 25일 출금 예정`),
+                summary.otherCards > 0 && React.createElement("div", { style: S.heroBadge }, "기타 카드 포함")),
+            React.createElement("div", { style: S.heroValue }, fmt(summary.billing), React.createElement("span", { style: S.heroUnit }, "원")),
+            React.createElement("div", { style: S.heroBreak },
+                React.createElement("span", null, "주력 3장 ", React.createElement("b", null, fmt(summary.billing - summary.otherCards)), "원"),
+                summary.otherCards > 0 && React.createElement("span", { style: S.heroSep }, "·"),
+                summary.otherCards > 0 && React.createElement("span", null, "기타 ", React.createElement("b", null, fmt(summary.otherCards)), "원")),
+            summary.billingDiscount > 0 && React.createElement("div", { style: S.heroDiscount }, `결제일할인 ${fmt(summary.billingDiscount)}원 차감 반영됨`)),
+        // 이번 달 사용 현황
+        React.createElement("div", { style: S.summaryGrid },
+            React.createElement("div", { style: S.summaryCell },
+                React.createElement("div", { style: S.summaryLabel }, "당월 이용"),
+                React.createElement("div", { style: S.summaryValue }, fmt(summary.confirmedAmount), React.createElement("span", { style: S.summaryUnit }, "원")),
+                React.createElement("div", { style: S.summaryFoot }, "실적 산정 기준")),
+            React.createElement("div", { style: S.summaryCell },
+                React.createElement("div", { style: S.summaryLabel }, "당월 피킹률"),
+                React.createElement("div", { style: { ...S.summaryValue, color: S.summaryValueAccent.color } }, summary.parkingRate == null ? "—" : `${summary.parkingRate.toFixed(2)}%`),
+                React.createElement("div", { style: S.summaryFoot }, "혜택 ", fmt(summary.reward), "원")),
+            summary.pendingCount > 0 && React.createElement("button", {
+                className: "chip",
+                onClick: onPendingClick,
+                style: { ...S.summaryCell, ...S.pendingCard, gridColumn: "1 / -1", borderColor: S.pendingBorder } },
+                React.createElement("div", { style: S.pendingRow },
+                    React.createElement("span", { style: S.summaryLabel }, `확정 대기 ${summary.pendingCount}건`),
+                    React.createElement("span", { style: S.pendingValue }, fmt(summary.pending), "원")),
+                React.createElement("div", { style: S.pendingFootRow },
+                    React.createElement("span", null, "실제 결제 금액을 입력하면 실적에 반영돼요"),
+                    React.createElement("span", { style: S.pendingArrow }, "확정하러 가기 ›")))),
+        React.createElement("div", { style: S.summaryHint },
+            React.createElement("b", null, "당월 이용"), "은 달력 기준(1일~말일) 실적·적립용, ",
+            React.createElement("b", null, "출금 예정"), "은 카드사 청구주기(신한 전월12일~당월11일 / 삼성 전월13일~당월12일) 기준이라 두 값은 다릅니다.")));
+}
+
+/* ============ 추천 ============ */
+function RecommendTab({ S, T, catQuery, setCatQuery, category, setCategory, amount, setAmount, months, setMonths, runRecommend, result, logTxn, cards, tierInfo, capWarnings }) {
+    return (React.createElement("main", { style: S.main },
+        React.createElement("section", { style: S.card },
+            React.createElement("label", { style: S.label }, "어디서 결제해요?"),
+            React.createElement("div", { style: S.searchWrap },
+                React.createElement("span", { style: S.searchIcon }, "\uD83D\uDD0D"),
+                React.createElement("input", { type: "text", value: catQuery,
+                    onChange: (e) => setCatQuery(e.target.value),
+                    placeholder: "이용처 검색 (예: 쿠팡이츠, 스타벅스, KTX)",
+                    style: S.searchInput }),
+                catQuery ? React.createElement("button", { className: "chip", onClick: () => setCatQuery(""), style: S.searchClear }, "\u2715") : null),
+            (() => {
+                const q = catQuery.trim().toLowerCase();
+                const match = (c) => !q || c.toLowerCase().includes(q) ||
+                    (CATEGORY_KEYWORDS[c] || []).some((k) => k.toLowerCase().includes(q));
+                const secs = CATEGORY_GROUPS
+                    .map((g) => ({ section: g.section, items: g.items.filter(match) }))
+                    .filter((g) => g.items.length > 0);
+                if (secs.length === 0)
+                    return React.createElement("div", { style: S.noMatch }, `'${catQuery}'에 맞는 이용처가 없어요. 비슷한 항목을 직접 골라주세요.`);
+                return React.createElement("div", null, secs.map((g) => (
+                    React.createElement("div", { key: g.section, style: S.catSection },
+                        React.createElement("div", { style: S.catSectionLabel }, g.section),
+                        React.createElement("div", { style: S.chipGrid }, g.items.map((c) => (
+                            React.createElement("button", { key: c, className: "chip",
+                                onClick: () => { setCategory(c); setCatQuery(""); },
+                                style: { ...S.chip, ...(category === c ? S.chipActive : {}) } }, c))))))));
+            })(),
+            capWarnings.length > 0 && (React.createElement("div", { style: S.warnStack }, capWarnings.map((w, i) => (React.createElement("div", { key: i, style: {
+                    ...S.warnBox,
+                    color: w.tone === "off" ? T.bad : T.warn,
+                    background: w.tone === "off" ? T.badBg : T.warnBg,
+                    borderColor: (w.tone === "off" ? T.bad : T.warn) + "55",
+                } }, w.text))))),
+            React.createElement("label", { style: { ...S.label, marginTop: 22, display: "block" } }, "결제 예정 금액"),
+            React.createElement("div", { style: S.amountRow },
+                React.createElement("input", {
+                    inputMode: "numeric",
+                    placeholder: "0",
+                    value: amount ? fmt(Number(amount)) : "",
+                    onChange: (e) => setAmount(e.target.value.replace(/[^0-9]/g, "")),
+                    style: S.amountInput
+                }),
+                React.createElement("span", { style: S.won }, "원")),
+            amount && Number(amount) > 0 && React.createElement("div", { style: S.koreanAmount }, numberToKorean(amount)),
+            React.createElement("label", { style: { ...S.label, marginTop: 20, display: "block" } }, "할부"),
+            React.createElement("div", { style: S.chipGrid }, INSTALLMENT_OPTIONS.map((m) => (React.createElement("button", { key: m, className: "chip", onClick: () => setMonths(m), style: { ...S.chip, ...(months === m ? S.chipActive : {}) } }, m === 1 ? "일시불" : `${m}개월`)))),
+            months > 1 && amount && (React.createElement("div", { style: S.hint },
+                "매달 약 ", fmt(perInstallment(Number(amount), months)), "원씩 ", months, "개월 출금돼요. 적립·실적은 전체 금액이 이번 달에 한 번에 반영됩니다.")),
+            React.createElement("button", { style: { ...S.primaryBtn, opacity: amount ? 1 : 0.45 }, onClick: runRecommend, disabled: !amount }, "추천받기")),
+        result && (React.createElement("section", { style: S.resultWrap }, result.ranked.map((r, i) => (React.createElement("div", { key: r.card.id, style: {
+                ...S.resultCard,
+                ...(i === 0 ? { borderColor: r.card.accent, boxShadow: `0 0 0 1px ${r.card.accent}55` } : {}),
+            } },
+            i === 0 && React.createElement("div", { style: S.bestBadge }, "이 카드가 제일 이득"),
+            React.createElement("div", { style: S.resultTop },
+                React.createElement("div", { style: { ...S.cardSwatch, background: r.card.color } }),
+                React.createElement("div", null,
+                    React.createElement("div", { style: S.resultName }, r.card.name),
+                    React.createElement("div", { style: S.resultSub }, r.card.sub)),
+                React.createElement("div", { style: S.resultValue }, r.rewardValue > 0 ? `+${fmt(r.rewardValue)}원` : "0원")),
+            React.createElement("div", { style: S.resultDetail }, r.detail),
+            r.notes && r.notes.length > 0 && (React.createElement("div", { style: S.resultNotes }, r.notes.map((n, k) => React.createElement("div", { key: k }, "· ", n)))),
+            React.createElement("button", { style: { ...S.logBtn, borderColor: r.card.accent, color: r.card.accent }, onClick: () => logTxn(r.card.id, result.category, result.amt, r.capUsed, r.rewardValue) }, "예상 결제로 기록하기")))))),
+        React.createElement("section", { style: S.thresholdStrip }, cards.map((c) => {
+            const t = tierInfo(c);
+            return (React.createElement("div", { key: c.id, style: S.thresholdChip },
+                React.createElement("span", { style: { ...S.dot, background: t.active ? "#3FBF7F" : "#D9584A" } }),
+                c.name, " ", t.active ? `${t.idx + 1}구간` : "실적 미충족"));
+        }))));
+}
+
+/* ============ 현황 ============ */
+function StatusTab({ S, cards, tierInfo, usageByCard, txns, thisMonth, lastMonth, thisMonthTotals, deleteTxn, confirmTxn, focusPending }) {
+    const pendingRef = React.useRef(null);
+    const [cardFilter, setCardFilter] = useState("all");
+    React.useEffect(() => {
+        if (focusPending && pendingRef.current)
+            pendingRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, [focusPending]);
+    const [editingId, setEditingId] = useState(null);
+    const [editAmount, setEditAmount] = useState("");
+    const [editMonths, setEditMonths] = useState(1);
+    const list = txns.filter((t) => t.date.slice(0, 7) === thisMonth).sort((a, b) => (a.date < b.date ? 1 : -1));
+    const pending = list.filter((t) => t.status === "pending");
+    const confirmed = list.filter((t) => t.status === "confirmed");
+    const shown = cardFilter === "all" ? confirmed : confirmed.filter((t) => t.cardId === cardFilter);
+    const startEdit = (t) => { setEditingId(t.id); setEditAmount(String(t.amount)); setEditMonths(t.installmentMonths || 1); };
+    const submitEdit = async (id) => {
+        const v = Number(editAmount);
+        if (!v || v <= 0) return;
+        await confirmTxn(id, v, editMonths);
+        setEditingId(null);
+        setEditAmount("");
+    };
+    return (React.createElement("main", { style: S.main },
+        cards.map((c) => {
+            const t = tierInfo(c);
+            const u = usageByCard[c.id] || { total: 0, byGroup: {}, byGroupDay: {} };
+            const base = c.tiers[0];
+            const pct = base > 0 ? Math.min((t.prevTotal / base) * 100, 100) : 100;
+            const oCap = c.overallCaps ? c.overallCaps[t.active ? t.idx : 0] : null;
+            const unit = c.mileageMode ? "마일" : "원";
+            return (React.createElement("section", { key: c.id, style: { ...S.card, borderLeft: `4px solid ${c.color}` } },
+                React.createElement("div", { style: S.statusHeadRow },
+                    React.createElement("div", null,
+                        React.createElement("div", { style: S.resultName }, c.name),
+                        React.createElement("div", { style: S.resultSub }, c.sub)),
+                    React.createElement("span", { style: { ...S.statusPill, background: t.active ? "rgba(63,191,127,0.15)" : "rgba(217,88,74,0.15)", color: t.active ? "#2E9E68" : "#C7452C" } }, base === 0 ? "실적 조건 없음" : t.active ? `${t.idx + 1}구간 적용` : "혜택 비활성")),
+                base > 0 && (React.createElement(React.Fragment, null,
+                    React.createElement("div", { style: S.progressTrack },
+                        React.createElement("div", { style: { ...S.progressFill, width: `${pct}%`, background: c.accent } })),
+                    React.createElement("div", { style: S.progressLabel },
+                        lastMonth, " 실적 ", fmt(t.prevTotal), "원 / 최소 ", fmt(base), "원",
+                        t.nextThreshold ? ` · 다음 구간 ${fmt(t.nextThreshold)}원` : ""),
+                    React.createElement("div", { style: S.progressLabel },
+                        thisMonth, " 누적 ", fmt((thisMonthTotals && thisMonthTotals[c.id]) || 0), "원 → 다음 달 실적이 돼요"))),
+                oCap != null && (React.createElement("div", { style: S.groupRow },
+                    React.createElement("span", null, "카드 전체 통합 한도"),
+                    React.createElement("span", { style: S.capValue }, fmt(u.total), " / ", fmt(oCap), unit))),
+                Object.entries(c.groups || {}).map(([gName, g]) => {
+                    const cap = g.caps[t.active ? t.idx : 0];
+                    const used = u.byGroup[gName] || 0;
+                    const members = ALL_CATEGORIES.filter((cat) => c.rates[cat] && c.rates[cat].group === gName);
+                    return (React.createElement("div", { key: gName, style: S.groupBlock },
+                        React.createElement("div", { style: S.groupRow },
+                            React.createElement("span", null, gName),
+                            React.createElement("span", { style: S.capValue }, fmt(used), " / ", cap == null ? "무제한" : fmt(cap), cap == null ? "" : unit)),
+                        React.createElement("div", { style: S.groupMembers },
+                            members.join(" · "),
+                            g.dailyCap != null ? ` · 하루 ${fmt(g.dailyCap)}${unit} 한도` : "")));
+                }),
+                React.createElement("div", { style: S.noteList }, (c.notes || []).map((n, i) => React.createElement("div", { key: i, style: S.noteItem }, "· ", n)))));
+        }),
+        React.createElement("section", { ref: pendingRef, style: { ...S.card, ...(pending.length > 0 ? S.pendingSection : {}) } },
+            React.createElement("div", { style: S.label }, "예상 결제 (확정 대기) · ", pending.length, "건"),
+            pending.length === 0 && React.createElement("div", { style: S.emptyState }, "확정 대기 중인 결제가 없어요."),
+            pending.map((t) => {
+                const c = cards.find((x) => x.id === t.cardId);
+                return (React.createElement("div", { key: t.id, style: S.txnRow },
+                    React.createElement("div", { style: { ...S.dot, background: c ? c.color : "#888" } }),
+                    React.createElement("div", { style: S.txnMain }, editingId === t.id ? (React.createElement("div", null,
+                        React.createElement("div", { style: S.editRow },
+                            React.createElement("input", {
+                                inputMode: "numeric",
+                                value: editAmount ? fmt(Number(editAmount)) : "",
+                                onChange: (e) => setEditAmount(e.target.value.replace(/[^0-9]/g, "")),
+                                style: S.editInput
+                            }),
+                            React.createElement("span", { style: S.unit }, "원")),
+                        editAmount && Number(editAmount) > 0 && React.createElement("div", { style: S.editKoreanAmount }, numberToKorean(editAmount)),
+                        React.createElement("div", { style: S.editMonthsRow }, INSTALLMENT_OPTIONS.map((m) => (React.createElement("button", { key: m, onClick: () => setEditMonths(m), style: { ...S.miniChip, ...(editMonths === m ? S.miniChipActive : {}) } }, m === 1 ? "일시불" : `${m}개월`)))),
+                        React.createElement("div", { style: S.editRow },
+                            React.createElement("button", { style: S.miniBtn, onClick: () => submitEdit(t.id) }, "확정"),
+                            React.createElement("button", { style: S.miniBtnGhost, onClick: () => setEditingId(null) }, "취소")))) : (React.createElement(React.Fragment, null,
+                        React.createElement("div", null,
+                            t.category, " · 예상 ", fmt(t.amount), "원",
+                            t.installmentMonths > 1 ? ` · ${t.installmentMonths}개월` : ""),
+                        React.createElement("div", { style: S.txnSub }, t.date, " · ", c ? c.name : t.cardId)))),
+                    editingId !== t.id && (React.createElement("div", { style: S.txnBtnCol },
+                        React.createElement("button", { style: S.miniBtn, onClick: () => startEdit(t) }, "실제 금액 확정"),
+                        React.createElement("button", { style: S.deleteBtn, onClick: () => deleteTxn(t.id) }, "삭제")))));
+            })),
+        React.createElement("section", { style: S.card },
+            React.createElement("div", { style: S.filterHead },
+                React.createElement("span", { style: S.label }, "확정된 결제 · ", shown.length, "건"),
+                cardFilter !== "all" && React.createElement("span", { style: S.filterSum }, fmt(shown.reduce((a, t) => a + t.amount, 0)), "원")),
+            React.createElement("div", { style: S.filterRow },
+                [{ id: "all", name: "전체", color: null }].concat(cards.map((c) => ({ id: c.id, name: c.name, color: c.color })))
+                    .map((f) => {
+                        const cnt = f.id === "all" ? confirmed.length : confirmed.filter((t) => t.cardId === f.id).length;
+                        const on = cardFilter === f.id;
+                        return React.createElement("button", { key: f.id, className: "chip",
+                            onClick: () => setCardFilter(f.id),
+                            style: { ...S.filterChip, ...(on ? { background: f.color || S.chipActive.background, color: "#fff", fontWeight: 700 } : {}) } },
+                            f.color && React.createElement("span", { style: { ...S.dot, background: on ? "#fff" : f.color, marginRight: 5 } }),
+                            f.name, React.createElement("span", { style: { ...S.filterCount, opacity: on ? 0.85 : 0.55 } }, cnt));
+                    })),
+            shown.length === 0 && React.createElement("div", { style: S.emptyState }, cardFilter === "all" ? "확정된 결제가 아직 없어요." : "이 카드로 확정된 결제가 없어요."),
+            shown.map((t) => {
+                const c = cards.find((x) => x.id === t.cardId);
+                return (React.createElement("div", { key: t.id, style: S.txnRow },
+                    React.createElement("div", { style: { ...S.dot, background: c ? c.color : "#888" } }),
+                    React.createElement("div", { style: S.txnMain },
+                        React.createElement("div", null,
+                            t.category, " · ", fmt(t.amount), "원",
+                            t.installmentMonths > 1 ? ` · ${t.installmentMonths}개월` : "", " ",
+                            React.createElement("span", { style: S.rewardInline }, "+", fmt(t.rewardValue || 0), "원")),
+                        React.createElement("div", { style: S.txnSub }, t.date, " · ", c ? c.name : t.cardId)),
+                    React.createElement("button", { style: S.deleteBtn, onClick: () => deleteTxn(t.id) }, "삭제")));
+            }))));
+}
+
+/* ============ 설정 ============ */
+function SettingsTab({ S, T: T2, cards, updateCard, resetDefaults, storageOk, lastSaved, txnCount, thisMonthKey, prevMonthKey, otherBilling, saveOther, payMonth }) {
+    return (React.createElement("main", { style: S.main },
+        React.createElement("section", { style: S.card },
+            React.createElement("div", { style: S.label }, "저장 상태"),
+            React.createElement("div", { style: S.saveRow },
+                React.createElement("span", { style: { ...S.dot, background: storageOk ? "#3FBF7F" : "#D9584A" } }),
+                React.createElement("span", { style: { fontSize: 13 } }, storageOk
+                    ? `기기에 저장 중 · 결제 기록 ${txnCount}건`
+                    : "저장 불가 — 화면을 닫으면 내용이 사라져요")),
+            React.createElement("div", { style: S.hint }, storageOk
+                ? `설정과 결제 기록은 이 기기에만 개인 저장되고, 앱을 다시 열어도 유지돼요.${lastSaved ? ` 마지막 저장 ${lastSaved.toLocaleTimeString("ko-KR")}.` : ""}`
+                : "저장 기능에 접근할 수 없는 환경이에요.")),
+        React.createElement("div", { style: S.settingsNote }, "구간별 한도는 배수가 아니라 ", React.createElement("b", null, "구간마다 별도 금액"), "이에요. 카드사 상품설명서 숫자를 그대로 넣어주세요."),
+        cards.map((c) => (React.createElement("section", { key: c.id, style: { ...S.card, borderLeft: `4px solid ${c.color}` } },
+            React.createElement("div", { style: S.resultName }, c.name),
+            React.createElement("div", { style: S.resultSub }, c.sub),
+            React.createElement("div", { style: S.divider }),
+            React.createElement("div", { style: S.label }, "월별 실적 직접 입력"),
+            React.createElement("div", { style: S.hint }, "앱에 기록하지 않은 기존 카드 사용액이에요. 여기 넣은 금액에 앱에서 기록한 결제가 더해져 그 달의 실적이 됩니다."),
+            [prevMonthKey, thisMonthKey].map((mk) => (React.createElement("div", { key: mk, style: S.settingRow },
+                React.createElement("span", null, mk, mk === thisMonthKey ? " (이번 달)" : " (지난달)"),
+                React.createElement("div", { style: S.inputWrap },
+                    React.createElement("input", { type: "text", inputMode: "numeric", value: (c.baselines && c.baselines[mk]) || 0, onChange: (e) => updateCard(c.id, (d) => {
+                            if (!d.baselines) d.baselines = {};
+                            d.baselines[mk] = Number(e.target.value.replace(/[^0-9]/g, "")) || 0;
+                        }), style: S.input }),
+                    React.createElement("span", { style: S.unit }, "원"))))),
+            React.createElement("div", { style: S.divider }),
+            React.createElement("div", { style: S.label }, "전월실적 구간 하한"),
+            React.createElement("div", { style: S.tierRow }, c.tiers.map((th, i) => (React.createElement("div", { key: i, style: S.tierCell },
+                React.createElement("div", { style: S.tierCellLabel }, i + 1, "구간"),
+                React.createElement("input", { type: "text", inputMode: "numeric", value: th, onChange: (e) => updateCard(c.id, (d) => { d.tiers[i] = Number(e.target.value.replace(/[^0-9]/g, "")) || 0; }), style: S.inputSmall }))))),
+            c.overallCaps && c.overallCaps.some((x) => x != null) && (React.createElement(React.Fragment, null,
+                React.createElement("div", { style: S.label2 }, "카드 전체 통합 한도"),
+                React.createElement("div", { style: S.tierRow }, c.overallCaps.map((cap, i) => (React.createElement("div", { key: i, style: S.tierCell },
+                    React.createElement("div", { style: S.tierCellLabel }, i + 1, "구간"),
+                    React.createElement("input", { type: "text", inputMode: "numeric", placeholder: "무제한", value: cap == null ? "" : cap, onChange: (e) => updateCard(c.id, (d) => {
+                            const v = e.target.value.replace(/[^0-9]/g, "");
+                            d.overallCaps[i] = v === "" ? null : Number(v);
+                        }), style: S.inputSmall }))))))),
+            c.mileageMode && (React.createElement(React.Fragment, null,
+                React.createElement("div", { style: S.divider }),
+                React.createElement("div", { style: S.settingRow },
+                    React.createElement("span", null, "마일당 가치"),
+                    React.createElement("div", { style: S.inputWrap },
+                        React.createElement("input", { type: "text", inputMode: "numeric", value: c.mileageValue, onChange: (e) => updateCard(c.id, (d) => { d.mileageValue = Number(e.target.value.replace(/[^0-9]/g, "")) || 0; }), style: S.input }),
+                        React.createElement("span", { style: S.unit }, "원/마일"))),
+                React.createElement("div", { style: S.hint }, "보수적으로 잡으려면 10~15원을 권해요."))),
+            React.createElement("div", { style: S.divider }),
+            React.createElement("div", { style: S.label }, "서비스 그룹 한도"),
+            Object.entries(c.groups || {}).map(([gName, g]) => (React.createElement("div", { key: gName, style: { marginTop: 10 } },
+                React.createElement("div", { style: S.settingCatName }, gName),
+                React.createElement("div", { style: S.tierRow },
+                    g.caps.map((cap, i) => (React.createElement("div", { key: i, style: S.tierCell },
+                        React.createElement("div", { style: S.tierCellLabel }, i + 1, "구간"),
+                        React.createElement("input", { type: "text", inputMode: "numeric", placeholder: "무제한", value: cap == null ? "" : cap, onChange: (e) => updateCard(c.id, (d) => {
+                                const v = e.target.value.replace(/[^0-9]/g, "");
+                                d.groups[gName].caps[i] = v === "" ? null : Number(v);
+                            }), style: S.inputSmall })))),
+                    React.createElement("div", { style: S.tierCell },
+                        React.createElement("div", { style: S.tierCellLabel }, "하루 한도"),
+                        React.createElement("input", { type: "text", inputMode: "numeric", placeholder: "없음", value: g.dailyCap == null ? "" : g.dailyCap, onChange: (e) => updateCard(c.id, (d) => {
+                                const v = e.target.value.replace(/[^0-9]/g, "");
+                                d.groups[gName].dailyCap = v === "" ? null : Number(v);
+                            }), style: S.inputSmall })))))),
+            React.createElement("div", { style: S.divider }),
+            React.createElement("div", { style: S.label }, "카테고리별 ", c.mileageMode ? "적립 마일" : "적립률", " · 1회 인정 상한"),
+            ALL_CATEGORIES.map((cat) => {
+                const info = c.rates[cat];
+                if (!info) return null;
+                return (React.createElement("div", { key: cat, style: S.catBlock },
+                    React.createElement("span", { style: S.settingCatName }, cat),
+                    React.createElement("div", { style: S.inputWrap },
+                        React.createElement("input", { type: "text", inputMode: "numeric", value: c.mileageMode ? info.miles : info.rate, onChange: (e) => updateCard(c.id, (d) => {
+                                const v = Number(e.target.value.replace(/[^0-9]/g, "")) || 0;
+                                if (c.mileageMode) d.rates[cat].miles = v;
+                                else d.rates[cat].rate = v;
+                            }), style: S.inputSmall }),
+                        React.createElement("span", { style: S.unit }, c.mileageMode ? "마일/천원" : "%"),
+                        React.createElement("input", { type: "text", inputMode: "numeric", placeholder: "제한없음", value: info.perTxnCap == null ? "" : info.perTxnCap, onChange: (e) => updateCard(c.id, (d) => {
+                                const v = e.target.value.replace(/[^0-9]/g, "");
+                                d.rates[cat].perTxnCap = v === "" ? null : Number(v);
+                            }), style: S.inputSmall }),
+                        React.createElement("span", { style: S.unit }, "1회"))));
+            })))),
+        React.createElement("button", { style: S.resetBtn, onClick: resetDefaults }, "기본값으로 초기화"),
+        React.createElement("button", { style: { ...S.resetBtn, marginTop: 8, color: T2.cherry, borderColor: T2.cherry + "66" },
+            onClick: async () => { try { await window.storage.delete("demo-card-txns-v5"); await window.storage.delete("demo-card-configs-v5"); } catch (e) { } location.reload(); } },
+            "데모 처음부터 다시 보기 (로그인 화면으로)")));
+}
+
+/* ============ 스타일 ============ */
+function makeStyles(T) {
+    return {
+        app: { minHeight: "100vh", background: T.bg, color: T.text, fontFamily: "'Pretendard', -apple-system, 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif", paddingBottom: 92 },
+        loginWrap: { minHeight: "100vh", background: "linear-gradient(160deg,#E5153A 0%,#B00A28 55%,#8E0620 100%)", display: "flex", flexDirection: "column", justifyContent: "space-between", padding: "calc(env(safe-area-inset-top,0px) + 72px) 26px calc(env(safe-area-inset-bottom,0px) + 46px)" },
+        loginTop: { flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", gap: 12 },
+        loginTag: { color: "rgba(255,255,255,0.88)", fontSize: 13.5, fontWeight: 600, letterSpacing: -0.2 },
+        loginLogoImg: { width: "min(66vw, 300px)", height: "auto", display: "block" },
+        loginBtns: { display: "flex", flexDirection: "column", gap: 11, width: "100%", maxWidth: 340, margin: "0 auto" },
+        oauthBtn: { display: "block", width: "100%", padding: 0, border: "none", background: "transparent", borderRadius: 12, overflow: "hidden", lineHeight: 0 },
+        oauthImg: { width: "100%", height: "auto", display: "block", borderRadius: 12 },
+        loginNote: { textAlign: "center", color: "rgba(255,255,255,0.62)", fontSize: 11.5, marginTop: 4 },
+        onbWrap: { minHeight: "100vh", background: T.bg, color: T.text, fontFamily: "'Pretendard', -apple-system, 'Apple SD Gothic Neo', sans-serif", padding: "calc(env(safe-area-inset-top,0px) + 44px) 18px 40px", display: "flex", flexDirection: "column", alignItems: "center" },
+        onbTag: { fontSize: 12.5, color: T.cherry, fontWeight: 700 },
+        onbLogoImg: { width: "min(50vw, 210px)", height: "auto", display: "block", marginTop: 6, marginBottom: 26 },
+        onbCard: { width: "100%", maxWidth: 460, background: T.surface, border: `1px solid ${T.border}`, borderRadius: 18, padding: 20 },
+        onbHead: { display: "flex", alignItems: "center", justifyContent: "space-between" },
+        onbTitle: { fontSize: 16.5, fontWeight: 800, letterSpacing: -0.3 },
+        onbStep: { fontSize: 11.5, color: T.textFaint, fontWeight: 700 },
+        onbLabel: { fontSize: 12.5, color: T.textDim, fontWeight: 700, marginTop: 18, marginBottom: 9 },
+        onbIssuerRow: { display: "flex", flexWrap: "wrap", gap: 7 },
+        onbIssuer: { padding: "9px 14px", borderRadius: 10, border: "none", background: T.chipBg, color: T.chipText, fontSize: 13, fontWeight: 600 },
+        onbCardList: { display: "flex", flexDirection: "column", gap: 8 },
+        onbItem: { display: "flex", alignItems: "center", gap: 10, width: "100%", textAlign: "left", padding: "13px 14px", borderRadius: 12, border: `1.5px solid ${T.border}`, background: "transparent", color: T.text, fontSize: 13.5, fontWeight: 600 },
+        onbItemOff: { opacity: 0.42, cursor: "not-allowed" },
+        onbItemText: { flex: 1, lineHeight: 1.4 },
+        onbSoon: { color: T.textFaint, fontSize: 11, fontWeight: 500 },
+        onbCheck: { width: 19, height: 19, borderRadius: 6, border: `1.5px solid ${T.borderStrong}`, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 11, flexShrink: 0 },
+        onbSubmit: { width: "100%", marginTop: 20, padding: "15px 0", borderRadius: 13, border: "none", background: `linear-gradient(115deg, ${T.accent}, ${T.cherry})`, color: "#fff", fontSize: 15, fontWeight: 800 },
+        onbSkip: { width: "100%", marginTop: 8, padding: "11px 0", borderRadius: 11, border: "none", background: "transparent", color: T.textFaint, fontSize: 12.5, fontWeight: 600 },
+        loadingScreen: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: T.bg },
+        loadingDot: { width: 10, height: 10, borderRadius: 999, background: T.accent },
+        header: { padding: "calc(env(safe-area-inset-top, 0px) + 20px) 20px 14px" },
+        headerEyebrow: { fontSize: 12, letterSpacing: 1.2, color: T.textFaint, textTransform: "uppercase", marginBottom: 6 },
+        headerTitle: { fontSize: 25, fontWeight: 800, margin: 0, letterSpacing: -0.8, display: "flex", alignItems: "center", gap: 4 },
+        headerLogoImg: { height: 32, width: "auto", display: "block" },
+        headerDot: { color: T.cherry, fontSize: 26, lineHeight: 1, transform: "translateY(-2px)" },
+        errorBanner: { margin: "0 16px 12px", padding: "10px 12px", borderRadius: 12, background: T.badBg, border: `1px solid ${T.bad}55`, color: T.bad, fontSize: 12, lineHeight: 1.5 },
+        heroCell: { background: T.heroBg, border: `1px solid ${T.heroBorder}`, borderRadius: 18, padding: "16px 18px 15px", marginBottom: 10 },
+        heroRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 },
+        heroLabel: { fontSize: 12.5, color: T.heroLabel, fontWeight: 700, letterSpacing: -0.2 },
+        heroBadge: { fontSize: 10, fontWeight: 700, color: T.accent, background: T.accentSoft, padding: "3px 8px", borderRadius: 999, whiteSpace: "nowrap" },
+        heroValue: { fontSize: 32, fontWeight: 900, color: T.text, letterSpacing: -1.2, marginTop: 6, lineHeight: 1.1 },
+        heroUnit: { fontSize: 16, fontWeight: 700, color: T.textDim, marginLeft: 3, letterSpacing: 0 },
+        heroBreak: { marginTop: 9, fontSize: 11.5, color: T.textDim, display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" },
+        heroSep: { color: T.textFaint },
+        heroDiscount: { marginTop: 7, fontSize: 11, color: T.good, fontWeight: 600 },
+        summaryGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
+        summaryCell: { background: T.surface, border: `1px solid ${T.border}`, borderRadius: 14, padding: "12px 13px" },
+        summaryLabel: { fontSize: 11.5, color: T.textFaint, marginBottom: 5, fontWeight: 600 },
+        summaryValue: { fontSize: 19, fontWeight: 800, color: T.text, letterSpacing: -0.5 },
+        summaryUnit: { fontSize: 12, fontWeight: 600, color: T.textDim, marginLeft: 2 },
+        summaryValueAccent: { color: T.cherry },
+        summaryFoot: { fontSize: 10.5, color: T.textFaint, marginTop: 4 },
+        pendingBorder: T.warn + "66",
+        badgeNow: { fontSize: 10, fontWeight: 700, color: T.accent, background: T.accentSoft, padding: "2px 7px", borderRadius: 999, marginLeft: 6 },
+        pendingRow: { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8 },
+        pendingValue: { fontSize: 16, fontWeight: 800, color: T.warn },
+        pendingCard: { textAlign: "left", width: "100%", cursor: "pointer", font: "inherit", background: T.warnBg, borderStyle: "solid", borderWidth: 1 },
+        pendingFootRow: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginTop: 5, fontSize: 10.5, color: T.textFaint },
+        pendingArrow: { color: T.warn, fontWeight: 700, whiteSpace: "nowrap" },
+        pendingSection: { borderColor: T.warn + "66", background: T.warnBg },
+        summaryHint: { marginTop: 10, fontSize: 11, color: T.textFaint, lineHeight: 1.65, padding: "0 2px" },
+        main: { padding: "0 16px", display: "flex", flexDirection: "column", gap: 14 },
+        card: { background: T.surface, border: `1px solid ${T.border}`, borderRadius: 18, padding: 18 },
+        label: { fontSize: 13, color: T.textDim, fontWeight: 700, letterSpacing: -0.2 },
+        label2: { fontSize: 12, color: T.textDim, fontWeight: 600, marginTop: 12 },
+        chipGrid: { display: "flex", flexWrap: "wrap", gap: 7, marginTop: 7 },
+        searchWrap: { display: "flex", alignItems: "center", gap: 8, marginTop: 11, background: T.chipBg, borderRadius: 12, padding: "10px 12px" },
+        searchIcon: { fontSize: 13, opacity: 0.6 },
+        searchInput: { flex: 1, minWidth: 0, background: "transparent", border: "none", color: T.text, fontSize: 13.5, fontWeight: 500 },
+        searchClear: { background: "transparent", border: "none", color: T.textFaint, fontSize: 13, padding: "0 2px", lineHeight: 1 },
+        catSection: { marginTop: 13 },
+        filterHead: { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8 },
+        filterSum: { fontSize: 12.5, fontWeight: 700, color: T.text },
+        filterRow: { display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10, marginBottom: 2 },
+        filterChip: { display: "inline-flex", alignItems: "center", padding: "7px 12px", borderRadius: 10, border: "none", background: T.chipBg, color: T.chipText, fontSize: 12.5, fontWeight: 600, WebkitTapHighlightColor: "transparent" },
+        filterCount: { marginLeft: 5, fontSize: 11, fontWeight: 700 },
+        catSectionLabel: { fontSize: 11, fontWeight: 700, color: T.textFaint, letterSpacing: 0.3 },
+        noMatch: { marginTop: 14, fontSize: 12.5, color: T.textFaint, lineHeight: 1.6, padding: "10px 2px" },
+        chip: { padding: "10px 16px", borderRadius: 12, border: "none", outline: "none", background: T.chipBg, color: T.chipText, fontSize: 13.5, fontWeight: 600, letterSpacing: -0.2, WebkitTapHighlightColor: "transparent", WebkitAppearance: "none", appearance: "none" },
+        chipActive: { background: T.cherry, color: T.cherryOn, fontWeight: 700, boxShadow: `0 6px 18px -6px ${T.cherryGlow}` },
+        warnStack: { marginTop: 12, display: "flex", flexDirection: "column", gap: 8 },
+        warnBox: { fontSize: 12, lineHeight: 1.55, border: "1px solid", borderRadius: 12, padding: "10px 12px" },
+        hint: { marginTop: 10, fontSize: 11.5, color: T.textFaint, lineHeight: 1.55 },
+        amountRow: { display: "flex", alignItems: "baseline", gap: 8, marginTop: 8, borderBottom: `1px solid ${T.borderStrong}`, paddingBottom: 8 },
+        amountInput: { flex: 1, background: "transparent", border: "none", color: T.text, fontSize: 28, fontWeight: 700, width: "100%" },
+        koreanAmount: { fontSize: 13, color: T.accent, fontWeight: 600, marginTop: 6, letterSpacing: -0.2 },
+        won: { fontSize: 16, color: T.textDim },
+        primaryBtn: { marginTop: 18, width: "100%", padding: "15px 0", borderRadius: 14, border: "none", background: `linear-gradient(115deg, ${T.accent} 0%, ${T.cherry} 100%)`, color: "#fff", fontWeight: 800, fontSize: 15.5, letterSpacing: -0.3, boxShadow: `0 8px 22px -10px ${T.cherryGlow}` },
+        resultWrap: { display: "flex", flexDirection: "column", gap: 12 },
+        resultCard: { position: "relative", borderRadius: 18, border: `1px solid ${T.border}`, padding: "18px 16px 16px", background: T.surface },
+        bestBadge: { position: "absolute", top: -11, left: 16, fontSize: 11, fontWeight: 800, color: "#fff", padding: "4px 11px", borderRadius: 999, background: T.cherry, boxShadow: `0 4px 12px -4px ${T.cherryGlow}` },
+        resultTop: { display: "flex", alignItems: "center", gap: 12 },
+        cardSwatch: { width: 34, height: 34, borderRadius: 10, flexShrink: 0 },
+        resultName: { fontSize: 15.5, fontWeight: 700 },
+        resultSub: { fontSize: 12, color: T.textFaint, marginTop: 1 },
+        resultValue: { marginLeft: "auto", fontSize: 18, fontWeight: 800, color: T.good },
+        resultDetail: { marginTop: 10, fontSize: 12.5, color: T.textDim, lineHeight: 1.5 },
+        resultNotes: { marginTop: 6, fontSize: 11.5, color: T.textFaint, lineHeight: 1.6 },
+        logBtn: { marginTop: 12, width: "100%", padding: "10px 0", borderRadius: 10, background: "transparent", border: "1px solid", fontWeight: 700, fontSize: 13 },
+        thresholdStrip: { display: "flex", flexWrap: "wrap", gap: 8, paddingTop: 4 },
+        thresholdChip: { display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: T.textDim, background: T.surface, padding: "6px 10px", borderRadius: 999, border: `1px solid ${T.border}` },
+        dot: { width: 7, height: 7, borderRadius: 999, flexShrink: 0 },
+        statusHeadRow: { display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 },
+        statusPill: { fontSize: 11, fontWeight: 700, padding: "4px 9px", borderRadius: 999, whiteSpace: "nowrap" },
+        progressTrack: { marginTop: 12, height: 6, borderRadius: 999, background: T.track, overflow: "hidden" },
+        progressFill: { height: "100%", borderRadius: 999 },
+        progressLabel: { marginTop: 6, fontSize: 11.5, color: T.textFaint },
+        groupBlock: { marginTop: 12 },
+        groupRow: { display: "flex", justifyContent: "space-between", fontSize: 12.5, fontWeight: 600, color: T.textDim, marginTop: 12, gap: 8 },
+        groupMembers: { fontSize: 10.5, color: T.textFaint, marginTop: 3, lineHeight: 1.5 },
+        capValue: { color: T.textFaint, fontWeight: 500, whiteSpace: "nowrap" },
+        noteList: { marginTop: 14, borderTop: `1px solid ${T.border}`, paddingTop: 10 },
+        noteItem: { fontSize: 11.5, color: T.textFaint, lineHeight: 1.6, marginBottom: 3 },
+        emptyState: { fontSize: 13, color: T.textFaint, padding: "16px 0" },
+        txnRow: { display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderTop: `1px solid ${T.border}` },
+        txnMain: { flex: 1, fontSize: 13.5 },
+        txnSub: { fontSize: 11.5, color: T.textFaint, marginTop: 2 },
+        txnBtnCol: { display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" },
+        rewardInline: { color: T.good, fontWeight: 700 },
+        deleteBtn: { background: "transparent", border: "none", color: T.bad, fontSize: 12 },
+        miniBtn: { background: T.accent, border: "none", color: T.onAccent, fontSize: 11.5, borderRadius: 8, padding: "6px 10px", fontWeight: 700 },
+        miniBtnGhost: { background: "transparent", border: `1px solid ${T.borderStrong}`, color: T.textDim, fontSize: 11.5, borderRadius: 8, padding: "6px 10px" },
+        editRow: { display: "flex", alignItems: "center", gap: 6, marginTop: 6 },
+        editInput: { width: 100, background: T.inputBg, border: `1px solid ${T.borderStrong}`, borderRadius: 8, color: T.text, padding: "6px 8px", fontSize: 13 },
+        editKoreanAmount: { fontSize: 11, color: T.accent, fontWeight: 600, marginTop: 2 },
+        editMonthsRow: { display: "flex", flexWrap: "wrap", gap: 5, marginTop: 6 },
+        miniChip: { padding: "4px 9px", borderRadius: 999, border: `1px solid ${T.border}`, background: T.chipBg, color: T.textDim, fontSize: 11 },
+        miniChipActive: { background: T.accent, borderColor: T.accent, color: T.onAccent, fontWeight: 700 },
+        saveRow: { display: "flex", alignItems: "center", gap: 8, marginTop: 10 },
+        settingsNote: { fontSize: 12.5, color: T.textDim, lineHeight: 1.6, padding: "2px 4px" },
+        settingRow: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 10, fontSize: 13.5 },
+        inputWrap: { display: "flex", alignItems: "center", gap: 5 },
+        input: { width: 90, background: T.inputBg, border: `1px solid ${T.border}`, borderRadius: 8, color: T.text, padding: "6px 8px", fontSize: 13, textAlign: "right" },
+        inputSmall: { width: "100%", minWidth: 44, background: T.inputBg, border: `1px solid ${T.border}`, borderRadius: 8, color: T.text, padding: "6px 6px", fontSize: 12.5, textAlign: "right" },
+        unit: { fontSize: 10.5, color: T.textFaint, whiteSpace: "nowrap" },
+        divider: { height: 1, background: T.border, margin: "14px 0 10px" },
+        tierRow: { display: "flex", gap: 6, marginTop: 6 },
+        tierCell: { flex: 1, minWidth: 0 },
+        tierCellLabel: { fontSize: 10, color: T.textFaint, marginBottom: 3 },
+        catBlock: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, paddingTop: 9, marginTop: 8, borderTop: `1px solid ${T.border}` },
+        settingCatName: { fontSize: 13, color: T.text, fontWeight: 600 },
+        resetBtn: { padding: "12px 0", borderRadius: 12, border: `1px solid ${T.borderStrong}`, background: "transparent", color: T.textDim, fontSize: 13, fontWeight: 600 },
+        tabbar: { position: "fixed", bottom: 0, left: 0, right: 0, display: "flex", background: T.tabbar, backdropFilter: "blur(12px)", borderTop: `1px solid ${T.border}`, padding: "10px 8px calc(10px + env(safe-area-inset-bottom))" },
+        tabBtn: { flex: 1, background: "transparent", border: "none", color: T.textFaint, fontSize: 12.5, fontWeight: 600, padding: "9px 0 11px" },
+        tabBtnActive: { color: T.text, fontWeight: 800 },
+    };
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(CardPicker));
+</script>
+
+<!-- 서비스 워커 등록 스크립트 추가 -->
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function() {
+      navigator.serviceWorker.register('service-worker.js').then(function(registration) {
+        console.log('ServiceWorker registration successful with scope: ', registration.scope);
+      }, function(err) {
+        console.log('ServiceWorker registration failed: ', err);
+      });
+    });
+  }
+</script>
+
+</body>
+</html>
