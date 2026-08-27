@@ -6,10 +6,10 @@
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#0C0E1A",
-  "theme_color": "#0C0E1A",
+  "background_color": "#FAFAFA",
+  "theme_color": "#FAFAFA",
   "lang": "ko-KR",
-  "description": "체리피커를 위한 카드 추천 서비스 (데모)",
+  "description": "결제하기 전 1초, 가장 많이 돌려받는 카드를 골라주는 서비스",
   "icons": [
     {
       "src": "./icons/icon-192.png",
