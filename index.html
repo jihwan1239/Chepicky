@@ -290,8 +290,10 @@ function adaptCard(payload, i) {
   const groups = {};
   const rates = {};
   for (const b of payload.혜택 || []) {
+    // 앱에 미리 적어둔 목록에 없어도 버리지 않는다.
+    // 관리자 도구에서 새 이용처가 생겨도 앱을 고칠 필요가 없어야 하기 때문.
     const cat = normCategory(b.카테고리);
-    if (!cat || !ALL_CATEGORIES.includes(cat)) continue;
+    if (!cat) continue;
     const rate = Number(b.비율) || 0;
     if (rate <= 0) continue;
 
@@ -338,6 +340,19 @@ async function fetchCards(baseUrl) {
   if (!list.length) throw new Error("공개된 카드가 아직 없습니다");
   return list;
 }
+
+/* 결제 방식.
+   국내 카드는 대체로 무이자 할부 건에 할인·적립을 주지 않고, 전월 실적에서도 뺀다.
+   (신한카드 처음: "무이자할부(슬림할부 등 부분 무이자 포함) 이용거래" 적립 제외,
+    삼성 iD SELECT: "무이자할부 이용금액" 할인 제외, KB NEED Pay도 동일)
+   유이자 할부는 보통 혜택 대상이고 실적에도 들어간다. */
+const PAY_TYPES = ["일시불", "할부", "무이자할부"];
+const INSTALLMENT_MONTHS = [2, 3, 4, 5, 6, 9, 10, 12, 18, 24];
+const isFreeInstallment = (t) => (t && t.pay) === "무이자할부";
+const payLabel = (t) => {
+  if (!t || !t.pay || t.pay === "일시불") return "";
+  return t.pay === "무이자할부" ? `무이자 ${t.months || 0}개월` : `할부 ${t.months || 0}개월`;
+};
 
 const K = { picked: "picked-v1", txns: "txns-v1", base: "base-v1", fixed: "fixed-v1",
   backend: "backend-url-v1", cache: "cards-cache-v1" };
@@ -404,9 +419,15 @@ function remainingCapFor(card, cat, tIdx, u, dateStr) {
 }
 
 /* 결제 1건의 혜택. 순수 함수라 '지금 추천'과 '지난 기록 재계산' 양쪽에 같이 쓴다. */
-function rewardOf(card, cat, amt, tIdx, u, dateStr) {
+function rewardOf(card, cat, amt, tIdx, u, dateStr, pay) {
   const notes = [];
   const info = card.rates[cat];
+
+  // 무이자 할부는 혜택 대상에서 빠진다. 카드별로 다르면 noFreeInstallmentBenefit 로 끈다.
+  if (pay === "무이자할부" && card.noFreeInstallmentBenefit !== false)
+    return { value: 0, capUsed: 0, detail: "무이자 할부는 혜택 제외", notes,
+      blockedBy: "무이자할부" };
+
   if (!info) return { value: 0, capUsed: 0, detail: "혜택 대상 아님", notes };
   if (tIdx < 0) return { value: 0, capUsed: 0, detail: "전월 실적 미충족", notes };
 
@@ -562,7 +583,8 @@ function App() {
   const prevLogTotals = useMemo(() => {
     const m = {};
     for (const c of myCards)
-      m[c.id] = allTxns.filter((t) => t.cardId === c.id && t.date.slice(0, 7) === lastMonth)
+      m[c.id] = allTxns
+        .filter((t) => t.cardId === c.id && t.date.slice(0, 7) === lastMonth && !isFreeInstallment(t))
         .reduce((s, t) => s + t.amount, 0);
     return m;
   }, [myCards, allTxns, lastMonth]);
@@ -570,8 +592,10 @@ function App() {
   const currTotals = useMemo(() => {
     const m = {};
     for (const c of myCards) {
+      // 무이자 할부는 전월 실적 산정에서 빠지므로 이번 달 실적에도 넣지 않는다
       m[c.id] = Number((baseline[c.id] || {}).curr || 0)
-        + allTxns.filter((t) => t.cardId === c.id && t.date.slice(0, 7) === thisMonth)
+        + allTxns
+          .filter((t) => t.cardId === c.id && t.date.slice(0, 7) === thisMonth && !isFreeInstallment(t))
           .reduce((s, t) => s + t.amount, 0);
     }
     return m;
@@ -602,7 +626,7 @@ function App() {
         .sort((a, b) => (a.date === b.date ? String(a.id).localeCompare(String(b.id))
                                            : a.date.localeCompare(b.date)));
       for (const t of mine) {
-        const r = rewardOf(c, t.category, t.amount, tIdx, u, t.date);
+        const r = rewardOf(c, t.category, t.amount, tIdx, u, t.date, t.pay);
         byTxn[t.id] = r;
         applyUsage(c, t.category, u, r.capUsed);
         const g = c.rates[t.category] && c.rates[t.category].group;
@@ -615,13 +639,15 @@ function App() {
 
   const usageByCard = sim.usage;
 
-  const calcReward = useCallback((card, cat, amt) => {
+  const calcReward = useCallback((card, cat, amt, pay) => {
     const t = tierInfo(card);
     const u = usageByCard[card.id] || { total: 0, byGroup: {}, byGroupDay: {} };
-    return { ...rewardOf(card, cat, amt, t.idx, u, today), tier: t };
+    return { ...rewardOf(card, cat, amt, t.idx, u, today, pay), tier: t };
   }, [tierInfo, usageByCard, today]);
 
-  /* 내 카드가 실제로 혜택을 주는 이용처만 노출 */
+  /* 고른 카드가 실제로 혜택을 주는 이용처만 노출한다.
+     카드를 바꾸면 이 목록도 바뀐다. 앱이 모르는 이용처가 백엔드에서 와도
+     버리지 않고 뒤에 붙여, 관리자 쪽에서 이용처를 늘려도 앱 수정이 필요 없다. */
   const myCategories = useMemo(() => {
     const set = new Set();
     for (const c of myCards)
@@ -629,7 +655,9 @@ function App() {
         const r = c.rates[cat];
         if ((r.rate && r.rate > 0) || (r.miles && r.miles > 0)) set.add(cat);
       }
-    return ALL_CATEGORIES.filter((x) => set.has(x));
+    const known = ALL_CATEGORIES.filter((x) => set.has(x));
+    const unknown = [...set].filter((x) => !ALL_CATEGORIES.includes(x)).sort();
+    return known.concat(unknown);
   }, [myCards]);
 
   if (!loaded) return h("div", { id: "boot" }, "불러오는 중…");
@@ -968,9 +996,15 @@ function MainApp(props) {
 /* ---------------- 추천 ---------------- */
 function RecommendTab({ myCards, myCategories, calcReward, txns, saveTxns, today, currTotals, tierInfo, summary }) {
   const [category, setCategory] = useState(myCategories[0] || "음식점");
+  // 카드를 바꿔서 고른 이용처가 목록에서 사라지면 첫 항목으로 되돌린다
+  useEffect(() => {
+    if (myCategories.length && !myCategories.includes(category)) setCategory(myCategories[0]);
+  }, [myCategories, category]);
   const [amount, setAmount] = useState("");
   const [result, setResult] = useState(null);
   const [q, setQ] = useState("");
+  const [pay, setPay] = useState("일시불");
+  const [months, setMonths] = useState(3);
   const amt = Number(amount) || 0;
   // 이용처가 많을 때만 검색칸을 띄워 평소 화면은 단순하게 유지한다
   const searchable = myCategories.length > 8;
@@ -986,14 +1020,15 @@ function RecommendTab({ myCards, myCategories, calcReward, txns, saveTxns, today
 
   const run = () => {
     if (amt <= 0) return;
-    const ranked = myCards.map((c) => ({ card: c, ...calcReward(c, category, amt) }))
+    const ranked = myCards.map((c) => ({ card: c, ...calcReward(c, category, amt, pay) }))
       .sort((a, b) => b.value - a.value);
-    setResult({ amt, category, ranked });
+    setResult({ amt, category, pay, months, ranked });
   };
 
   const log = (r) => {
     saveTxns(txns.concat({
       id: uid(), date: today, cardId: r.card.id, category, amount: amt,
+      pay, months: pay === "일시불" ? null : months,
     }));
     setResult(null); setAmount("");
   };
@@ -1043,6 +1078,25 @@ function RecommendTab({ myCards, myCategories, calcReward, txns, saveTxns, today
       h("div", { style: { marginBottom: 12 } },
         h(MoneyInput, { big: true, value: amount,
           onChange: (v) => { setAmount(v); setResult(null); } })),
+
+      h("span", { className: "label" }, "결제 방식"),
+      h("div", { style: { display: "flex", gap: 6, marginBottom: pay === "일시불" ? 14 : 9 } },
+        PAY_TYPES.map((t) => h("button", { key: t,
+          className: "chip" + (pay === t ? " on" : ""),
+          onClick: () => { setPay(t); setResult(null); },
+          style: { flex: 1, textAlign: "center" } }, t))),
+
+      pay !== "일시불" && h("div", { style: { marginBottom: 14 } },
+        h("select", { className: "field", value: months,
+          onChange: (e) => { setMonths(Number(e.target.value)); setResult(null); },
+          style: { fontFamily: "var(--sans)", fontSize: 14, textAlign: "left" } },
+          INSTALLMENT_MONTHS.map((m) => h("option", { key: m, value: m }, m + "개월")))),
+
+      pay === "무이자할부" && h("div", { className: "help", style: { marginBottom: 14,
+        padding: "10px 12px", borderRadius: 9, background: "var(--warn-soft)",
+        border: "1px solid #F0E2C0", color: "var(--warn)" } },
+        "무이자 할부는 대부분의 카드에서 할인·적립이 제외되고 전월 실적에도 잡히지 않아요."),
+
       h("button", { className: "btn btn-primary", onClick: run, disabled: amt <= 0 }, "추천받기")),
 
     result && h(ResultView, { result, log }),
@@ -1053,6 +1107,32 @@ function RecommendTab({ myCards, myCategories, calcReward, txns, saveTxns, today
 function ResultView({ result, log }) {
   const [best, ...rest] = result.ranked;
   if (!best) return null;
+
+  // 무이자 할부는 어느 카드로 긁어도 혜택이 0이다.
+  // 순위를 매기는 대신 그 사실과 대안을 알려주는 편이 정직하고 쓸모 있다.
+  if (result.pay === "무이자할부")
+    return h("div", { className: "fade" },
+      h("section", { className: "card", style: { padding: 16, marginBottom: 10 } },
+        h("div", { style: { fontSize: 15, fontWeight: 800, marginBottom: 8 } },
+          "무이자 할부는 어느 카드든 혜택이 없어요"),
+        h("div", { className: "help", style: { marginBottom: 12 } },
+          "무이자 할부 건은 할인·적립 대상에서 빠지고, 다음 달 실적에도 잡히지 않습니다. ",
+          "혜택을 받으려면 일시불이나 유이자 할부로 결제해야 해요."),
+        h("div", { style: { padding: "11px 12px", borderRadius: 9, background: "#F6F6F9",
+          border: "1px solid var(--line)" } },
+          h("div", { className: "help" },
+            "일시불로 결제하면 ", h("b", { style: { color: "var(--brand)" } },
+              result.ranked[0] ? result.ranked[0].card.name : ""),
+            " 기준 혜택을 받을 수 있는지 다시 확인해보세요.")),
+        h("div", { style: { display: "flex", flexDirection: "column", gap: 6, marginTop: 12 } },
+          result.ranked.map((r) =>
+            h("button", { key: r.card.id, onClick: () => log(r),
+              style: { display: "flex", alignItems: "center", gap: 9, padding: "10px 12px",
+                border: "1px solid var(--line)", borderRadius: 8, background: "var(--surface)",
+                textAlign: "left" } },
+              h("span", { style: { flex: 1, fontSize: 13, fontWeight: 600 } }, r.card.name),
+              h("span", { style: { fontSize: 11, color: "var(--faint)" } }, "이 카드로 기록"))))));
+
   return h("div", { className: "fade" },
     h("section", { className: "card", style: { padding: 16, marginBottom: 10,
       borderColor: "var(--brand)", background: "var(--brand-soft)" } },
@@ -1142,9 +1222,26 @@ function TxnForm({ draft, setDraft, myCards, myCategories, onSave, onCancel, onD
     h("span", { className: "label" }, "이용처"),
     h("select", { className: "field", value: draft.category || "",
       onChange: (e) => setDraft({ ...draft, category: e.target.value }),
-      style: { fontFamily: "var(--sans)", fontSize: 14, textAlign: "left", marginBottom: 12 } },
+      style: { fontFamily: "var(--sans)", fontSize: 14, textAlign: "left", marginBottom: 10 } },
       h("option", { value: "" }, "이용처 선택"),
       myCategories.map((c) => h("option", { key: c, value: c }, c))),
+
+    h("span", { className: "label" }, "결제 방식"),
+    h("div", { style: { display: "flex", gap: 6, marginBottom: draft.pay === "일시불" ? 12 : 8 } },
+      PAY_TYPES.map((t) => h("button", { key: t,
+        className: "chip" + (draft.pay === t ? " on" : ""),
+        onClick: () => setDraft({ ...draft, pay: t, months: t === "일시불" ? null : (draft.months || 3) }),
+        style: { flex: 1, textAlign: "center" } }, t))),
+
+    draft.pay !== "일시불" && h("select", { className: "field", value: draft.months || 3,
+      onChange: (e) => setDraft({ ...draft, months: Number(e.target.value) }),
+      style: { fontFamily: "var(--sans)", fontSize: 14, textAlign: "left", marginBottom: 8 } },
+      INSTALLMENT_MONTHS.map((m) => h("option", { key: m, value: m }, m + "개월"))),
+
+    draft.pay === "무이자할부" && h("div", { className: "help", style: { marginBottom: 12,
+      padding: "9px 11px", borderRadius: 8, background: "var(--warn-soft)",
+      border: "1px solid #F0E2C0", color: "var(--warn)" } },
+      "무이자 할부는 혜택과 실적에서 모두 빠집니다."),
 
     h("div", { style: { display: "flex", gap: 8 } },
       onDelete && h("button", { className: "btn btn-ghost", onClick: onDelete,
@@ -1165,16 +1262,19 @@ function StatusTab({ myCards, myCategories, tierInfo, usageByCard, txns, saveTxn
 
   const startNew = () => {
     setEditing("new");
-    setDraft({ date: today, cardId: myCards[0]?.id || "", category: myCategories[0] || "", amount: "" });
+    setDraft({ date: today, cardId: myCards[0]?.id || "", category: myCategories[0] || "",
+      amount: "", pay: "일시불", months: null });
   };
   const startEdit = (t) => {
     if (t.fixed) return; // 고정비는 설정에서 관리
     setEditing(t.id);
-    setDraft({ date: t.date, cardId: t.cardId, category: t.category, amount: String(t.amount) });
+    setDraft({ date: t.date, cardId: t.cardId, category: t.category, amount: String(t.amount),
+      pay: t.pay || "일시불", months: t.months || null });
   };
   const save = () => {
     const clean = { date: draft.date, cardId: draft.cardId, category: draft.category,
-      amount: Number(String(draft.amount).replace(/[^\d]/g, "")) || 0 };
+      amount: Number(String(draft.amount).replace(/[^\d]/g, "")) || 0,
+      pay: draft.pay || "일시불", months: draft.pay === "일시불" ? null : (draft.months || 3) };
     if (editing === "new") saveTxns(txns.concat({ id: uid(), ...clean }));
     else saveTxns(txns.map((x) => (x.id === editing ? { ...x, ...clean } : x)));
     setEditing(null); setDraft(null);
@@ -1258,7 +1358,12 @@ function StatusTab({ myCards, myCategories, tierInfo, usageByCard, txns, saveTxn
                 t.fixed && h("span", { style: { fontSize: 10, color: "var(--faint)",
                   marginLeft: 6, fontWeight: 500 } }, "고정비")),
               h("div", { style: { fontSize: 11, color: "var(--faint)", marginTop: 2 } },
-                `${t.date.slice(5).replace("-", "/")} · ${c ? c.name : "카드"}`)),
+                `${t.date.slice(5).replace("-", "/")} · ${c ? c.name : "카드"}`,
+                payLabel(t) && h("span", { style: {
+                  marginLeft: 6, padding: "1px 6px", borderRadius: 4,
+                  background: isFreeInstallment(t) ? "var(--warn-soft)" : "#EFEFF2",
+                  color: isFreeInstallment(t) ? "var(--warn)" : "var(--dim)",
+                  fontWeight: 650 } }, payLabel(t)))),
             h("div", { style: { textAlign: "right", flexShrink: 0 } },
               h("div", { className: "num", style: { fontSize: 14, fontWeight: 700 } }, fmt(t.amount) + "원"),
               r.value > 0 && h("div", { className: "num",
