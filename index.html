@@ -177,7 +177,12 @@ function matchCategory(cat, q) {
 
 const DEFAULT_CARDS = [
   {
-    id: "shinhan", name: "신한카드 처음", sub: "ANNIVERSE", accent: "#5B4B8A",
+    id: "shinhan", name: "신한카드 처음", sub: "ANNIVERSE", accent: "#5B4B8A", issuer: "신한카드",
+    annualFee: 18000,
+    // 상품설명서: "카드 사용 등록월의 다음 달 말(등록월+1개월)까지는
+    //             전월 이용금액 30만원 이상 50만원 미만 구간의 서비스가 적용"
+    newGrace: { months: 1, tierIdx: 0, capRatio: 1,
+      note: "발급 후 다음 달 말까지 30~50만원 구간 혜택" },
     mileageMode: false, tiers: [300000, 500000, 1000000], overallCaps: [18000, 36000, 70000],
     groups: {
       "오늘도 5%": { caps: [5000, 10000, 20000], dailyCap: 1000 },
@@ -205,7 +210,8 @@ const DEFAULT_CARDS = [
     },
   },
   {
-    id: "skypass", name: "삼성 마일리지 플래티넘", sub: "SKYPASS", accent: "#1B4B5A",
+    id: "skypass", name: "삼성 마일리지 플래티넘", sub: "SKYPASS", accent: "#1B4B5A", issuer: "삼성카드",
+    annualFee: 49000, newGrace: null,
     mileageMode: true, mileageValue: 15, tiers: [0], overallCaps: [null],
     groups: { "특별적립": { caps: [2000], dailyCap: null } },
     notes: [
@@ -225,7 +231,9 @@ const DEFAULT_CARDS = [
     },
   },
   {
-    id: "toss_samsung", name: "토스 삼성카드", sub: "TOSS", accent: "#0050FF",
+    id: "toss_samsung", name: "토스 삼성카드", sub: "TOSS", accent: "#0050FF", issuer: "삼성카드",
+    annualFee: 10000,
+    newGrace: { months: 1, tierIdx: 0, capRatio: 1, note: "발급 후 다음 달 말까지 1구간 혜택" },
     mileageMode: false, tiers: [300000, 600000, 900000], overallCaps: [null, null, null],
     discountAtBilling: true,
     groups: {
@@ -318,12 +326,24 @@ function adaptCard(payload, i) {
     if (!prev || rate > prev.rate) rates[cat] = { rate, group: g, perTxnCap };
   }
 
+  // 신규 발급 유예(첫 달~다음 달까지 실적 없이도 혜택) 문구 자동 감지.
+  // 상품설명서에 "등록월+1개월", "발급월+1개월" 같은 표현으로 거의 항상 나온다.
+  const noteText = (payload.유의사항 || []).concat(payload.실적제외항목 || []).join(" ");
+  let newGrace = null;
+  if (/발급월\s*\+\s*1개월|등록월\s*\+\s*1개월|다음\s*달\s*말일까지|최초\s*신규\s*발급/.test(noteText)) {
+    const half = /50\s*%/.test(noteText);
+    newGrace = { months: 1, tierIdx: 0, capRatio: half ? 0.5 : 1,
+      note: "발급 후 다음 달 말까지 첫 구간 혜택" + (half ? " (한도 50%)" : "") };
+  }
+
   return {
     id: payload.id || `card-${i}`,
     name: payload.카드명 || "이름 없는 카드",
     sub: payload.카드사 || "",
     issuer: payload.카드사 || "기타",
     accent: ACCENTS[i % ACCENTS.length],
+    annualFee: Number(payload.연회비_해외 ?? payload.연회비_국내) || 0,
+    newGrace,
     mileageMode: false,
     tiers, overallCaps: overall, groups, rates,
     notes: (payload.유의사항 || []).slice(0, 6),
@@ -402,24 +422,25 @@ function MoneyInput({ value, onChange, placeholder, big, autoFocus }) {
 }
 
 /* 남은 한도 계산 (그룹 월한도 / 그룹 일한도 / 카드 전체 한도 중 가장 빡빡한 값) */
-function remainingCapFor(card, cat, tIdx, u, dateStr) {
+function remainingCapFor(card, cat, tIdx, u, dateStr, capRatio) {
   const info = card.rates[cat];
   if (!info) return 0;
+  const k = capRatio == null ? 1 : capRatio;
   let rem = Infinity;
   if (info.group && card.groups[info.group]) {
     const g = card.groups[info.group];
     const gCap = g.caps[tIdx];
-    if (gCap != null) rem = Math.min(rem, Math.max(gCap - (u.byGroup[info.group] || 0), 0));
+    if (gCap != null) rem = Math.min(rem, Math.max(gCap * k - (u.byGroup[info.group] || 0), 0));
     if (g.dailyCap != null)
-      rem = Math.min(rem, Math.max(g.dailyCap - (u.byGroupDay[`${info.group}|${dateStr}`] || 0), 0));
+      rem = Math.min(rem, Math.max(g.dailyCap * k - (u.byGroupDay[`${info.group}|${dateStr}`] || 0), 0));
   }
   const oCap = card.overallCaps ? card.overallCaps[tIdx] : null;
-  if (oCap != null) rem = Math.min(rem, Math.max(oCap - u.total, 0));
+  if (oCap != null) rem = Math.min(rem, Math.max(oCap * k - u.total, 0));
   return rem;
 }
 
 /* 결제 1건의 혜택. 순수 함수라 '지금 추천'과 '지난 기록 재계산' 양쪽에 같이 쓴다. */
-function rewardOf(card, cat, amt, tIdx, u, dateStr, pay) {
+function rewardOf(card, cat, amt, tIdx, u, dateStr, pay, capRatio) {
   const notes = [];
   const info = card.rates[cat];
 
@@ -431,7 +452,7 @@ function rewardOf(card, cat, amt, tIdx, u, dateStr, pay) {
   if (!info) return { value: 0, capUsed: 0, detail: "혜택 대상 아님", notes };
   if (tIdx < 0) return { value: 0, capUsed: 0, detail: "전월 실적 미충족", notes };
 
-  const rem = remainingCapFor(card, cat, tIdx, u, dateStr);
+  const rem = remainingCapFor(card, cat, tIdx, u, dateStr, capRatio);
   let eligible = amt;
   if (info.perTxnCap != null && amt > info.perTxnCap) {
     eligible = info.perTxnCap;
@@ -470,6 +491,54 @@ function applyUsage(card, cat, u, capUsed) {
     u.byGroup[g] = (u.byGroup[g] || 0) + capUsed;
   }
   return u;
+}
+
+/* 주어진 결제 목록을 특정 카드로 전부 긁었다고 가정하고 한 달 혜택을 계산한다.
+   실적 구간은 그 카드로 그만큼 썼을 때를 가정해 정한다(같은 소비 패턴 유지 가정). */
+function simulateCardOnTxns(card, txnList) {
+  const spend = txnList
+    .filter((t) => !isFreeInstallment(t))
+    .reduce((s, t) => s + t.amount, 0);
+  const tIdx = card.tiers[0] === 0 ? 0 : tierIndexFor(card, spend);
+  if (tIdx < 0) return { benefit: 0, tIdx, spend, tierMet: false };
+
+  const u = { total: 0, byGroup: {}, byGroupDay: {} };
+  let benefit = 0;
+  for (const t of txnList.slice().sort((a, b) => a.date.localeCompare(b.date))) {
+    const r = rewardOf(card, t.category, t.amount, tIdx, u, t.date, t.pay, 1);
+    benefit += r.value;
+    applyUsage(card, t.category, u, r.capUsed);
+    const g = card.rates[t.category] && card.rates[t.category].group;
+    if (g) u.byGroupDay[`${g}|${t.date}`] = (u.byGroupDay[`${g}|${t.date}`] || 0) + r.capUsed;
+  }
+  return { benefit, tIdx, spend, tierMet: true };
+}
+
+/* 보유 카드를 다른 카드로 바꿨을 때 이득이 되는지 비교한다.
+   연회비 차액을 12로 나눠 월 단위로 환산해 순이득을 계산한다. */
+function suggestSwaps(myCards, catalog, monthTxns, minTxns) {
+  const out = [];
+  for (const owned of myCards) {
+    const mine = monthTxns.filter((t) => t.cardId === owned.id);
+    if (mine.length < (minTxns || 4)) continue;
+
+    const cur = simulateCardOnTxns(owned, mine);
+    for (const cand of catalog) {
+      if (cand.id === owned.id) continue;
+      if (myCards.some((c) => c.id === cand.id)) continue; // 이미 쓰는 카드는 제외
+      const alt = simulateCardOnTxns(cand, mine);
+      const feeDiffMonthly = ((cand.annualFee || 0) - (owned.annualFee || 0)) / 12;
+      const net = (alt.benefit - cur.benefit) - feeDiffMonthly;
+      if (net <= 0) continue;
+      out.push({
+        from: owned, to: cand, net,
+        curBenefit: cur.benefit, altBenefit: alt.benefit,
+        feeDiffMonthly, spend: cur.spend, txnCount: mine.length,
+        tierMet: alt.tierMet,
+      });
+    }
+  }
+  return out.sort((a, b) => b.net - a.net).slice(0, 3);
 }
 
 /* ================================================================
@@ -608,7 +677,16 @@ function App() {
     if (logged > 0) idx = tierIndexFor(card, logged);
     else if (b.tier != null) idx = b.tier;
     else idx = card.tiers[0] === 0 ? 0 : -1;
-    return { idx, active: idx >= 0, loggedPrev: logged,
+
+    // 신규 발급 유예: 실적이 모자라도 카드사가 첫 구간 혜택을 미리 주는 기간.
+    // 사용자가 '유예 기간에 해당한다'고 답한 카드에만 적용한다.
+    let grace = false;
+    if (card.newGrace && b.isNew && idx < card.newGrace.tierIdx) {
+      idx = card.newGrace.tierIdx;
+      grace = true;
+    }
+    return { idx, active: idx >= 0, loggedPrev: logged, grace,
+      capRatio: grace ? (card.newGrace.capRatio || 1) : 1,
       nextThreshold: idx + 1 < card.tiers.length ? card.tiers[idx + 1] : null };
   }, [baseline, prevLogTotals]);
 
@@ -620,13 +698,14 @@ function App() {
     const byTxn = {};
     for (const c of myCards) {
       const u = { total: 0, byGroup: {}, byGroupDay: {} };
-      const tIdx = tierInfo(c).idx;
+      const ti = tierInfo(c);
+      const tIdx = ti.idx;
       const mine = allTxns
         .filter((t) => t.cardId === c.id && t.date.slice(0, 7) === thisMonth)
         .sort((a, b) => (a.date === b.date ? String(a.id).localeCompare(String(b.id))
                                            : a.date.localeCompare(b.date)));
       for (const t of mine) {
-        const r = rewardOf(c, t.category, t.amount, tIdx, u, t.date, t.pay);
+        const r = rewardOf(c, t.category, t.amount, tIdx, u, t.date, t.pay, ti.capRatio);
         byTxn[t.id] = r;
         applyUsage(c, t.category, u, r.capUsed);
         const g = c.rates[t.category] && c.rates[t.category].group;
@@ -642,7 +721,7 @@ function App() {
   const calcReward = useCallback((card, cat, amt, pay) => {
     const t = tierInfo(card);
     const u = usageByCard[card.id] || { total: 0, byGroup: {}, byGroupDay: {} };
-    return { ...rewardOf(card, cat, amt, t.idx, u, today, pay), tier: t };
+    return { ...rewardOf(card, cat, amt, t.idx, u, today, pay, t.capRatio), tier: t };
   }, [tierInfo, usageByCard, today]);
 
   /* 고른 카드가 실제로 혜택을 주는 이용처만 노출한다.
@@ -686,7 +765,7 @@ function App() {
     myCards, myCategories, tab, setTab, calcReward, tierInfo, usageByCard,
     currTotals, txns, saveTxns, allTxns, fixed, saveFixed, txnResults: sim.byTxn,
     baseline, setBaseline: saveBaseline, today, thisMonth, lastMonth,
-    onEditCards: () => setStage("cards"), picked,
+    onEditCards: () => setStage("cards"), picked, catalog,
     backendUrl, reloadCards, source, syncErr,
   });
 }
@@ -827,6 +906,21 @@ function BaselineScreen({ myCards, baseline, setBaseline, lastMonth, thisMonth, 
 
                 h("span", { className: "label" }, `당월 1일~${tm}/${td} 이용 금액`),
                 h(MoneyInput, { value: b.curr ?? "", onChange: (v) => set(c.id, "curr", Number(v) || 0) }),
+
+                // 카드사는 신규 발급자에게 실적 없이도 첫 구간 혜택을 주는 경우가 많다.
+                // 해당하면 실적 구간과 무관하게 혜택이 켜지므로 반드시 물어봐야 한다.
+                c.newGrace && h("div", { style: { marginTop: 12, padding: "11px 12px",
+                  borderRadius: 9, background: "#F6F6F9", border: "1px solid var(--line)" } },
+                  h("div", { style: { fontSize: 13, fontWeight: 700, marginBottom: 4 } },
+                    "이 카드, 최근에 새로 발급받으셨나요?"),
+                  h("div", { className: "help", style: { marginBottom: 9, color: "var(--faint)" } },
+                    c.newGrace.note + " — 해당되면 실적이 모자라도 혜택이 들어갑니다."),
+                  h("div", { style: { display: "flex", gap: 6 } },
+                    [[true, "네, 신규예요"], [false, "아니요"]].map(([v, label]) =>
+                      h("button", { key: String(v),
+                        className: "chip" + (b.isNew === v ? " on" : ""),
+                        onClick: () => set(c.id, "isNew", v),
+                        style: { flex: 1, textAlign: "center" } }, label)))),
 
                 h("button", { onClick: () => setHelp(open ? null : c.id),
                   style: { marginTop: 8, width: "100%", display: "flex", alignItems: "center",
@@ -1182,7 +1276,7 @@ function TierStrip({ myCards, tierInfo, currTotals }) {
           h("span", { style: { fontSize: 10, fontWeight: 700, padding: "3px 7px", borderRadius: 5,
             background: t.active ? "#F1F9F5" : "var(--warn-soft)",
             color: t.active ? "var(--good)" : "var(--warn)" } },
-            t.active ? `${t.idx + 1}구간 적용 중` : "실적 미달")),
+            t.grace ? "신규 혜택 적용 중" : t.active ? `${t.idx + 1}구간 적용 중` : "실적 미달")),
         target > 0 && h("div", null,
           h("div", { style: { height: 5, borderRadius: 3, background: "#EFEFF2", overflow: "hidden" } },
             h("div", { style: { height: "100%", width: pct + "%", background: c.accent, borderRadius: 3,
@@ -1253,11 +1347,13 @@ function TxnForm({ draft, setDraft, myCards, myCategories, onSave, onCancel, onD
 
 /* ---------------- 이번 달 ---------------- */
 function StatusTab({ myCards, myCategories, tierInfo, usageByCard, txns, saveTxns, allTxns,
-  thisMonth, today, summary, txnResults }) {
+  thisMonth, today, summary, txnResults, catalog }) {
   const [editing, setEditing] = useState(null); // txn id | "new"
   const [draft, setDraft] = useState(null);
+  const [cardFilter, setCardFilter] = useState("all");
 
-  const mine = allTxns.filter((t) => t.date.slice(0, 7) === thisMonth);
+  const monthTxns = allTxns.filter((t) => t.date.slice(0, 7) === thisMonth);
+  const mine = cardFilter === "all" ? monthTxns : monthTxns.filter((t) => t.cardId === cardFilter);
   const rate = summary.rate;
 
   const startNew = () => {
@@ -1299,7 +1395,9 @@ function StatusTab({ myCards, myCategories, tierInfo, usageByCard, txns, saveTxn
           h("div", { style: { fontSize: 11, color: "var(--dim)", marginTop: 2 } },
             "혜택 " + fmt(summary.reward) + "원")))),
 
-    h("div", { className: "label", style: { marginBottom: 8 } }, "카드별 남은 한도"),
+    h(SwapSuggest, { myCards, catalog, monthTxns }),
+
+    h("div", { className: "label", style: { marginBottom: 8 } }, "카드별 혜택 한도"),
     myCards.map((c) => {
       const t = tierInfo(c);
       const u = usageByCard[c.id] || { total: 0, byGroup: {} };
@@ -1335,13 +1433,24 @@ function StatusTab({ myCards, myCategories, tierInfo, usageByCard, txns, saveTxn
         style: { fontSize: 12.5, fontWeight: 700, color: "var(--brand)", padding: "4px 2px" } },
         "+ 직접 추가")),
 
+    myCards.length > 1 && h("div", { className: "chiprow", style: { marginBottom: 9 } },
+      [{ id: "all", name: "전체" }].concat(myCards).map((c) => {
+        const n = c.id === "all" ? monthTxns.length
+          : monthTxns.filter((t) => t.cardId === c.id).length;
+        return h("button", { key: c.id, onClick: () => setCardFilter(c.id),
+          className: "chip" + (cardFilter === c.id ? " on" : "") },
+          c.name, h("span", { className: "num", style: { marginLeft: 5, opacity: .7 } }, n));
+      })),
+
     editing === "new" && h(TxnForm, { draft, setDraft, myCards, myCategories,
       onSave: save, onCancel: () => { setEditing(null); setDraft(null); } }),
 
     mine.length === 0 && editing !== "new"
       ? h("div", { className: "card", style: { padding: "24px 16px", textAlign: "center",
           fontSize: 13, color: "var(--faint)", lineHeight: 1.7 } },
-          "아직 기록이 없어요.", h("br"), "추천을 받거나 직접 추가해보세요.")
+          cardFilter === "all"
+            ? h("span", null, "아직 기록이 없어요.", h("br"), "추천을 받거나 직접 추가해보세요.")
+            : "이 카드로 결제한 기록이 없어요.")
       : mine.slice().sort((a, b) => b.date.localeCompare(a.date)).map((t) => {
           if (editing === t.id)
             return h(TxnForm, { key: t.id, draft, setDraft, myCards, myCategories,
@@ -1370,6 +1479,89 @@ function StatusTab({ myCards, myCategories, tierInfo, usageByCard, txns, saveTxn
                 style: { fontSize: 11, color: "var(--good)", marginTop: 1 } }, "+" + fmt(r.value))),
             !t.fixed && h("span", { style: { fontSize: 11, color: "var(--faint)", flexShrink: 0 } }, "\u203a"));
         }));
+}
+
+/* 카드 교체 제안. 계산 근거를 반드시 같이 보여준다 —
+   "얼마 더 받는다"만 있으면 사용자가 믿을 근거가 없기 때문. */
+function SwapSuggest({ myCards, catalog, monthTxns }) {
+  const [open, setOpen] = useState(null);
+  const MIN = 4;
+  const swaps = useMemo(
+    () => suggestSwaps(myCards, catalog, monthTxns, MIN),
+    [myCards, catalog, monthTxns]
+  );
+
+  const enough = myCards.some((c) => monthTxns.filter((t) => t.cardId === c.id).length >= MIN);
+  if (!enough)
+    return h("div", { className: "card", style: { padding: "14px 15px", marginBottom: 14 } },
+      h("div", { style: { fontSize: 13, fontWeight: 700, marginBottom: 5 } }, "카드 교체 분석"),
+      h("div", { className: "help", style: { color: "var(--faint)" } },
+        `결제 기록이 카드당 ${MIN}건 이상 쌓이면, 등록된 모든 카드와 비교해 더 나은 카드를 찾아드려요.`));
+
+  if (!swaps.length)
+    return h("div", { className: "card", style: { padding: "14px 15px", marginBottom: 14,
+      background: "#F1F9F5", borderColor: "#D3EBDF" } },
+      h("div", { style: { fontSize: 13, fontWeight: 700, color: "var(--good)", marginBottom: 5 } },
+        "지금 카드 조합이 가장 좋아요"),
+      h("div", { className: "help", style: { color: "var(--dim)" } },
+        "이번 달 소비 패턴으로 등록된 카드를 모두 비교했지만, 연회비까지 따지면 바꿔서 이득인 카드가 없었습니다."));
+
+  return h("div", { style: { marginBottom: 14 } },
+    h("div", { className: "label", style: { marginBottom: 8 } }, "카드 교체 제안"),
+    swaps.map((s2, i) => {
+      const isOpen = open === i;
+      return h("div", { key: i, className: "card",
+        style: { padding: "14px 15px", marginBottom: 7,
+          borderColor: i === 0 ? "var(--brand)" : "var(--line)",
+          background: i === 0 ? "var(--brand-soft)" : "var(--surface)" } },
+        h("div", { style: { fontSize: 13.5, fontWeight: 700, lineHeight: 1.6,
+          color: i === 0 ? "var(--brand)" : "var(--ink)" } },
+          `현재 사용중인 \u2018${s2.from.name}\u2019을 `,
+          h("b", null, `\u2018${s2.to.name}\u2019`),
+          `${josa(s2.to.name)} 대체하시면`),
+        h("div", { style: { display: "flex", alignItems: "baseline", gap: 5, margin: "8px 0 2px" } },
+          h("span", { className: "num", style: { fontSize: 24, fontWeight: 800,
+            color: "var(--brand)" } }, "월 " + fmt(s2.net)),
+          h("span", { style: { fontSize: 13, fontWeight: 700, color: "var(--brand)" } },
+            "원을 더 받아요")),
+        h("div", { className: "help", style: { color: "var(--dim)", marginTop: 4 } },
+          "연회비 차이까지 반영한 금액이에요."),
+
+        h("button", { onClick: () => setOpen(isOpen ? null : i),
+          style: { marginTop: 10, width: "100%", display: "flex", alignItems: "center",
+            justifyContent: "space-between", padding: "9px 11px", borderRadius: 8,
+            border: "1px solid var(--line)", background: "var(--surface)",
+            fontSize: 12.5, fontWeight: 650, color: "var(--dim)" } },
+          h("span", null, "어떻게 계산했나요?"),
+          h("span", { style: { fontSize: 10, color: "var(--faint)",
+            transform: isOpen ? "rotate(180deg)" : "none", transition: "transform .18s" } }, "\u25BC")),
+
+        isOpen && h("div", { style: { marginTop: 8, padding: "12px 13px", borderRadius: 9,
+          background: "var(--surface)", border: "1px solid var(--line)" } },
+          h("div", { className: "help", style: { marginBottom: 9 } },
+            `이번 달 \u2018${s2.from.name}\u2019로 결제한 `,
+            h("b", { className: "num" }, s2.txnCount), "건(",
+            h("b", { className: "num" }, fmt(s2.spend)), "원)을 그대로 옮겨 계산했어요."),
+          [["지금 카드 혜택", fmt(s2.curBenefit) + "원", "var(--dim)"],
+           ["바꿨을 때 혜택", fmt(s2.altBenefit) + "원", "var(--good)"],
+           ["연회비 차이 (월)", (s2.feeDiffMonthly >= 0 ? "-" : "+") + fmt(Math.abs(s2.feeDiffMonthly)) + "원",
+            s2.feeDiffMonthly > 0 ? "var(--brand)" : "var(--good)"]].map(([k, v, col]) =>
+            h("div", { key: k, style: { display: "flex", justifyContent: "space-between",
+              fontSize: 12.5, padding: "5px 0" } },
+              h("span", { style: { color: "var(--dim)" } }, k),
+              h("span", { className: "num", style: { fontWeight: 700, color: col } }, v))),
+          h("div", { style: { display: "flex", justifyContent: "space-between",
+            fontSize: 13, padding: "8px 0 0", marginTop: 4,
+            borderTop: "1px solid var(--line)" } },
+            h("b", null, "월 순이득"),
+            h("b", { className: "num", style: { color: "var(--brand)" } }, fmt(s2.net) + "원")),
+          h("div", { className: "help", style: { marginTop: 10, color: "var(--faint)",
+            paddingTop: 9, borderTop: "1px dashed #DDD" } },
+            "연회비는 ", h("b", null, fmt(s2.to.annualFee || 0)), "원과 ",
+            h("b", null, fmt(s2.from.annualFee || 0)), "원의 차액을 12로 나눠 월 단위로 환산했습니다. ",
+            "지금 소비 패턴이 계속 유지된다고 가정한 값이라 실제와 다를 수 있어요. ",
+            "카드를 새로 만들면 실적 조건을 처음부터 채워야 하는 점도 함께 고려하세요.")));
+    }));
 }
 
 /* ---------------- 설정 ---------------- */
@@ -1421,7 +1613,17 @@ function SettingsTab({ myCards, fixed, saveFixed, baseline, setBaseline, onEditC
               onClick: () => setBaseline({ ...baseline, [c.id]: { ...b, tier: o.idx } }) }, o.label))),
           h("span", { className: "label" }, "당월 앱 사용 전까지의 이용 금액"),
           h(MoneyInput, { value: b.curr ?? "",
-            onChange: (v) => setBaseline({ ...baseline, [c.id]: { ...b, curr: Number(v) || 0 } }) }));
+            onChange: (v) => setBaseline({ ...baseline, [c.id]: { ...b, curr: Number(v) || 0 } }) }),
+          c.newGrace && h("div", { style: { marginTop: 10 } },
+            h("span", { className: "label" }, "신규 발급 유예 기간"),
+            h("div", { style: { display: "flex", gap: 6 } },
+              [[true, "해당됨"], [false, "해당 없음"]].map(([v, label]) =>
+                h("button", { key: String(v),
+                  className: "chip" + (b.isNew === v ? " on" : ""),
+                  onClick: () => setBaseline({ ...baseline, [c.id]: { ...b, isNew: v } }),
+                  style: { flex: 1, textAlign: "center" } }, label))),
+            h("div", { className: "help", style: { marginTop: 6, color: "var(--faint)" } },
+              c.newGrace.note)));
       })),
 
     h("section", { style: { marginBottom: 20 } },
